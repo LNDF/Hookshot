@@ -431,6 +431,7 @@ public partial class MainWindow : Window
         PrepareTick.IsChecked = !s.PrepareLater;
         if (!string.IsNullOrEmpty(s.Out)) OutPath.Text = s.Out;
         DlssTick.IsChecked = s.Dlss;
+        dlssLicense = s.DlssLicense;
         FsrTick.IsChecked = s.Fsr;
         fsrLicense = s.FsrLicense;
         MemoryBox.SelectedItem = BuildMemory.Saved(MemoryBox.ItemsSource.Cast<object>(), s.MemoryGb);
@@ -458,7 +459,8 @@ public partial class MainWindow : Window
             var s = new BuilderSettings { Out = BuilderHome.SavePath(OutPath.Text),
                                           Nup = BuilderHome.SavePath(romfs == null ? chosenNup : null),
                                           Romfs = BuilderHome.SavePath(romfs), Exefs = BuilderHome.SavePath(exefs),
-                                          Dlss = DlssTick.IsChecked == true, Fsr = FsrTick.IsChecked == true,
+                                          Dlss = DlssTick.IsChecked == true, DlssLicense = dlssLicense,
+                                          Fsr = FsrTick.IsChecked == true,
                                           FsrLicense = fsrLicense,
                                           PrepareLater = PrepareTick.IsChecked != true,
                                           MemoryGb = MemoryBox.SelectedItem is int gb ? gb : null,
@@ -893,12 +895,18 @@ public partial class MainWindow : Window
         "Hookshot never includes or shares them: never share a game folder built with them.\n\n" +
         "Do you accept NVIDIA's license?";
 
+    /// NVIDIA's license accepted on the DLSS tick, kept in the settings (DlssLicense): an update keeps a folder's DLSS by it.
+    /// It was the SDK's LICENSE.txt, a download: with the SDK gone, the update built without DLSS and its runtime went
+    bool dlssLicense;
+
     /// The NVIDIA DLSS tick: NVIDIA's license first, and the tick stays only when it is accepted
     void DlssChanged(object sender, RoutedEventArgs e)
     {
         if (DlssTick.IsChecked == true &&
             MessageBox.Show(this, DlssLicense, "NVIDIA DLSS", MessageBoxButton.YesNo, MessageBoxImage.Information) != MessageBoxResult.Yes)
             DlssTick.IsChecked = false;
+        else if (DlssTick.IsChecked == true)
+            dlssLicense = true;
         SaveSettings();   // (kept at once, not only when Build is pressed: ticked and closed, it is still ticked next time)
     }
 
@@ -1420,13 +1428,14 @@ public partial class MainWindow : Window
         download = null;
         if (rows.TryGetValue("download", out var d)) { d.Done(); d.Small("Build tools checked"); }
         // (the saved tick also opts an existing game into DLSS. After a self-update ApplySettings has not run yet;
-        // a folder already built with DLSS keeps it, its license accepted then)
-        var dlss = BuilderSettings.Load(SettingsPath)?.Dlss == true ||
+        // a folder already built with DLSS keeps it, its license accepted then: the settings' record, or for a license accepted
+        // before the record, the SDK's LICENSE.txt)
+        var saved = BuilderSettings.Load(SettingsPath);
+        var dlss = saved?.Dlss == true ||
                    (File.Exists(System.IO.Path.Combine(folder, "ngx", "nvngx_dlss.dll")) &&
-                    File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt")));
+                    (saved?.DlssLicense == true || File.Exists(System.IO.Path.Combine(Storage.NgxSdk, "LICENSE.txt"))));
         // (AMD FSR 4, the same: the saved tick with AMD's license accepted, or a folder built with FSR 4 whose AMD runtime
         // was fetched, AMD's license saved beside it then, keeps it and its runtime)
-        var saved = BuilderSettings.Load(SettingsPath);
         var fsr = (saved?.Fsr == true && saved.FsrLicense) ||
                   (File.Exists(System.IO.Path.Combine(folder, ".hookshot_fsr")) &&
                    File.Exists(System.IO.Path.Combine(folder, "amd_fidelityfx_upscaler_vk.dll")) &&
