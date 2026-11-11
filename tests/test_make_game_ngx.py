@@ -7,6 +7,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -189,8 +190,8 @@ class LinuxBuilderDlssTests(unittest.TestCase):
     def test_license_prompt_and_env(self):
         self.assertIn("https://github.com/NVIDIA/DLSS/blob/", self.builder.DLSS_LICENSE)
         self.assertIn("never share a game folder built with them", self.builder.DLSS_LICENSE)
-        with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(self.root)}):
-            sdk = str(self.root / "hookshot" / "builder" / "ngx-sdk")
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(self.root)}):
+            sdk = str(self.root / "hookshot-builder" / "ngx-sdk")   # (the builder's cache folder, not the game's data folder)
             self.assertEqual(self.builder.ngx_sdk_dir(), sdk)
             env_off = self.builder.make_game_env(False, {"HOOKSHOT_NGX_SDK": "/stale", "HOOKSHOT_VK_PREBUILT": "/app/hookshot_vk.so"})
             self.assertNotIn("HOOKSHOT_NGX_SDK", env_off)
@@ -210,6 +211,7 @@ class LinuxBuilderDlssTests(unittest.TestCase):
         self.assertFalse(win.dlss.get())
         self.assertFalse(win.dlss_toggled)
         self.assertEqual(saved.get("dlss"), "0")
+        self.assertNotIn("nvidia_license", saved)
 
     def test_accepting_license_saves_and_marks_toggled(self):
         saved = {}
@@ -220,18 +222,52 @@ class LinuxBuilderDlssTests(unittest.TestCase):
         self.assertTrue(win.dlss.get())
         self.assertTrue(win.dlss_toggled)
         self.assertEqual(saved.get("dlss"), "1")
+        self.assertEqual(saved.get("nvidia_license"), "1")   # (in the settings: the SDK's folder is a cache)
 
     def test_folder_has_dlss_needs_runtime_and_accepted_license(self):
         game = self.root / "game"
         (game / "ngx").mkdir(parents=True)
-        with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(self.root)}):
+        config = self.root / "config" / "builder.ini"
+        with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(self.root / "data"), "XDG_CACHE_HOME": str(self.root / "cache")}), \
+                mock.patch.object(self.builder, "CONFIG", str(config)):
             self.assertFalse(self.builder.folder_has_dlss(str(game)))
             (game / "ngx" / "libnvidia-ngx-dlss.so.310.9.16").write_bytes(b"rt")
             self.assertFalse(self.builder.folder_has_dlss(str(game)))
+            # (the SDK in the cache says nothing: the cache can be emptied, and the license was accepted or not all the same)
             lic = Path(self.builder.ngx_sdk_dir()) / "LICENSE.txt"
             lic.parent.mkdir(parents=True, exist_ok=True)
             lic.write_text("NVIDIA RTX SDKs license", encoding="utf-8")
+            self.assertFalse(self.builder.folder_has_dlss(str(game)))
+            self.builder.save_config({"nvidia_license": "1"})
             self.assertTrue(self.builder.folder_has_dlss(str(game)))
+            shutil.rmtree(Path(self.builder.ngx_sdk_dir()))   # (the cache emptied: an update keeps DLSS, and fetches the SDK again)
+            self.assertTrue(self.builder.folder_has_dlss(str(game)))
+
+    def test_old_sdk_moves_to_the_cache_and_its_license_is_recorded(self):
+        config = self.root / "config" / "builder.ini"
+        with mock.patch.dict(os.environ, {"HOOKSHOT_BUILDER_HOME": str(self.root / "data"), "XDG_CACHE_HOME": str(self.root / "cache")}), \
+                mock.patch.object(self.builder, "CONFIG", str(config)):
+            old = Path(self.builder.old_ngx_sdk_dir())
+            self.assertEqual(old, self.root / "data" / "hookshot" / "builder" / "ngx-sdk")
+            self.builder.move_old_ngx_sdk()   # (nothing there: nothing done, nothing recorded)
+            self.assertFalse(config.exists())
+            (old / "runtime").mkdir(parents=True)
+            (old / "LICENSE.txt").write_text("NVIDIA RTX SDKs license", encoding="utf-8")
+            (old / "runtime" / "libnvidia-ngx-dlss.so.310.9.16").write_bytes(b"rt")
+            self.builder.save_config({"out": "/games/hookshot"})
+            self.assertTrue(self.builder.license_accepted())   # (accepted before the record: the old SDK says so)
+            self.builder.move_old_ngx_sdk()
+            new = Path(self.builder.ngx_sdk_dir())
+            self.assertFalse(old.exists())
+            self.assertEqual((new / "runtime" / "libnvidia-ngx-dlss.so.310.9.16").read_bytes(), b"rt")
+            self.assertEqual(self.builder.load_config(), {"out": "/games/hookshot", "nvidia_license": "1"})
+            self.assertTrue(self.builder.license_accepted())
+            # (an SDK in both places: the cache's is kept, the old one goes)
+            (old).mkdir(parents=True)
+            (old / "LICENSE.txt").write_text("old", encoding="utf-8")
+            self.builder.move_old_ngx_sdk()
+            self.assertFalse(old.exists())
+            self.assertEqual((new / "LICENSE.txt").read_text(encoding="utf-8"), "NVIDIA RTX SDKs license")
 
     def test_toggling_dlss_on_up_to_date_folder_offers_update(self):
         game = self.root / "game"
