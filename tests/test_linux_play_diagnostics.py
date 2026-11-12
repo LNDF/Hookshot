@@ -119,6 +119,15 @@ def main():
         assert (folder / "completed").is_file() and not list(log.iterdir())
         assert not list(folder.glob(".hookshot-startup.*")) and not list(data_dir.glob(".hookshot-startup.*"))
 
+        # A failed real scope start uses the same bounded diagnostics, including why Play fell back.
+        log.rmdir()
+        namespace.update(own_scope=lambda env: ["scope"], start_scoped=lambda *args: False)
+        namespace["play"](str(folder))
+        assert processes[-1].wait(timeout=10) == 0
+        assert log.read_bytes() == data + b"Hookshot: systemd scope hand-off failed; started without a separate scope.\n"
+        assert not list(folder.glob(".hookshot-startup.*"))
+        namespace["own_scope"] = lambda env: []
+
     # The game's own log: a pipe on stderr is a reader to the game (FILE_TYPE_PIPE), and it then writes no hookshot_log.txt.
     with tempfile.TemporaryDirectory(prefix="hookshot-play-log-") as directory:
         folder = Path(directory)
@@ -132,7 +141,7 @@ def main():
         assert (folder / "logs" / "hookshot_startup.log").read_bytes() == b"before the log\n\nHookshot exited with status 73\n"
         assert not list(folder.glob(".hookshot-startup.*")) and not list((folder / "logs").glob(".hookshot-startup.*"))
     print("PASS: detached Play, bounded stderr, exit status, concurrent launches, publication failure, and the game's own "
-          "log beside the startup lines")
+          "log beside the startup lines, including scope fallback")
 
 
 if __name__ == "__main__":

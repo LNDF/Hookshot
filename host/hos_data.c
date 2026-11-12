@@ -76,6 +76,8 @@ static const char *const to_cache[] = {
     "hookshot_pipeline_states.bin", "hookshot_pipeline_states_v1.bin", "hookshot_prepared.bin", "hookshot_prepare_skipped",
     "hookshot_pipelines.bin.running",   /* (the precompile's crash count, beside its notes: vk_draw.cpp precompile_run) */
     "hookshot_driver_faults.txt",       /* (the programs this PC's driver faulted on: vk_draw.cpp driver_faults_path) */
+    "hookshot_programs.zst.bin", "hookshot_programs.zst.idx",   /* (RX_VK_PROGRAM_CACHE_ZSTD=1's program cache: vk_progcache.cpp) */
+    "hookshot_pipelines.bin.built", "hookshot_load_start.txt", "hookshot_module_ids.bin", "hookshot_compute_variants.bin",
 };
 /* The Vulkan pipeline cache, mkw_vk_pipelines.bin and its play files mkw_vk_pipelines_play_<n>.bin (mkw-recomp's names), renamed
    hookshot_vk_pipelines*.bin as they move into cache/ (gpu/vk/vk_draw.cpp) */
@@ -112,18 +114,25 @@ static int is_link(const char *p) {
    again in the new place to the same folder, never entered or copied through: written in full (realpath), so that one written
    from where it stood ("../../sync") still names it; one to an entry that moves too names that entry in the new place
    (move_old, move_new); one that names nothing goes as it was written */
-static const char *move_old, *move_new;   /* (the folder on the move, as realpath names it, and where it goes) */
+static const char *move_old, *move_from, *move_new;   /* (the folder on the move, as realpath names it and as given, and where it goes) */
+static int moved_to(char *target, const char *dir) {   /* (a target under dir: named where it will be) */
+    char there[PATH_MAX];
+    const size_t n = dir && dir[0] == SEP ? strlen(dir) : 0;
+    if (!n || strncmp(target, dir, n) || target[n] != SEP) return 0;
+    snprintf(there, sizeof there, "%s%s", move_new, target + n);
+    snprintf(target, PATH_MAX, "%s", there);
+    return 1;
+}
 static int copy_link(const char *from, const char *to) {
-    char target[PATH_MAX], there[PATH_MAX];
-    const size_t old = move_old ? strlen(move_old) : 0;
+    char target[PATH_MAX];
     if (!realpath(from, target)) {
         const ssize_t n = readlink(from, target, sizeof target - 1);
         if (n < 0) return 0;
         target[n] = 0;
-    } else if (old && !strncmp(target, move_old, old) && target[old] == SEP) {
-        snprintf(there, sizeof there, "%s%s", move_new, target + old);
-        snprintf(target, sizeof target, "%s", there);
     }
+    /* (to an entry that moves too: where it will be. One whose entry went first names nothing by now, so its text is
+       checked too: else it named the old place, and only when the folder listed it before the entry) */
+    if (!moved_to(target, move_old)) moved_to(target, move_from);
     return symlink(target, to) == 0;
 }
 #endif
@@ -330,7 +339,7 @@ static const char *move_saves(const char *beside) {
     }
 #ifndef _WIN32
     char real[PATH_MAX];
-    move_old = realpath(beside, real), move_new = data_dir;   /* (copy_link: links to entries that move too follow them) */
+    move_old = realpath(beside, real), move_from = beside, move_new = data_dir;   /* (copy_link: links to entries that move too follow them) */
 #endif
     static char names[MAX_SAVE_ENTRIES][MAX_PATH];
     static char how[MAX_SAVE_ENTRIES];   /* (1 renamed, 2 copied) */
@@ -425,6 +434,7 @@ static void tidy_game(const char *game) {
     for (size_t i = 0; i < sizeof to_logs / sizeof *to_logs; i++) tidied_files += move_file(game, to_logs[i], logs);
     for (size_t i = 0; i < sizeof to_cache / sizeof *to_cache; i++) tidied_files += move_file(game, to_cache[i], cache);
     tidied_files += move_pcache(game, cache);
+    tidied_files += move_as(game, "mkw_vk_pipelines.stamp", cache, "hookshot_vk_pipelines.stamp");   /* (which translator made them: pcache_stamp.h) */
     {   /* (what a write cut short left of the old pipeline cache: a .tmp, never read) */
         char pattern[MAX_PATH];
         snprintf(pattern, sizeof pattern, "%s%s*.tmp", game, old_pcache);

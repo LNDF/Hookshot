@@ -81,10 +81,10 @@ def game_folder(root, built, in_bin=False):
     files = {
         "hookshot_options.ini": "vsync=1\n", "hookshot_env.txt": "RX_VK_X=1\n", "hookshot_log.txt": "log\n",
         "hookshot_log.1.txt": "log 1\n", "hookshot_startup.log": "stderr\n", "language.txt": "fr\n", "mkw_vk_pipelines.bin": "driver",
-        "mkw_vk_pipelines_play_3.bin": "play", "hookshot_programs.bin": "programs", "hookshot_programs.idx": "index",
+        "mkw_vk_pipelines_play_3.bin": "play", "mkw_vk_pipelines.stamp": "stamp", "hookshot_programs.bin": "programs", "hookshot_programs.idx": "index",
         "hookshot_programs.bin.lock": "", "hookshot_pipelines.bin": "notes", "hookshot_prepared.bin": "prepared",
         "hookshot_shaders.bin": "seed", "hookshot_pipeline_states_shipped.bin": "shipped",
-        "hookshot_pipelines.bin.running": "1\n", "mkw_vk_pipelines_play_4.bin.tmp": "cut short",
+        "hookshot_pipelines.bin.running": "1\n", "hookshot_programs.zst.bin": "zstd", "hookshot_load_start.txt": "start\n", "mkw_vk_pipelines_play_4.bin.tmp": "cut short",
     }
     for name, text in files.items():
         (root / name).write_text(text)
@@ -232,8 +232,9 @@ def main():
                         str(ROOT / "host" / "hos_data.c"), str(ROOT / "host" / "posix" / "win32_posix.c"), str(main_c),
                         "-o", str(built), "-lpthread", "-ldl"], check=True)
 
-        CACHES = ("hookshot_vk_pipelines.bin", "hookshot_vk_pipelines_play_3.bin", "hookshot_programs.bin", "hookshot_programs.idx",
-                  "hookshot_pipelines.bin", "hookshot_prepared.bin", "hookshot_pipelines.bin.running")   # (the Vulkan pipeline cache renamed from mkw_vk_pipelines*)
+        CACHES = ("hookshot_vk_pipelines.bin", "hookshot_vk_pipelines_play_3.bin", "hookshot_vk_pipelines.stamp", "hookshot_programs.bin", "hookshot_programs.idx",
+                  "hookshot_pipelines.bin", "hookshot_prepared.bin", "hookshot_pipelines.bin.running",
+                  "hookshot_programs.zst.bin", "hookshot_load_start.txt")   # (the Vulkan pipeline cache renamed from mkw_vk_pipelines*)
         LOGS = ("hookshot_log.txt", "hookshot_log.1.txt", "hookshot_startup.log")
         SETTINGS = ("hookshot_options.ini", "hookshot_env.txt")
 

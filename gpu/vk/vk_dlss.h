@@ -20,6 +20,10 @@ DlssWhy dlss_why();
 /// Asks NGX once whether DLSS runs on this device, so dlss_why knows before the first upscale (the menu, when it opens).
 /// Nothing off an NVIDIA device with NGX's extensions, or in a build without DLSS
 void dlss_probe();
+/// A feature that was not made is asked for again at the next upscale (vk_dlss.cpp prepare's `refused`): the player
+/// changed a row the feature is made from (vk_temporal.cpp temporal_reset_failure, with the chain's lock held, as prepare
+/// has it)
+void dlss_retry();
 /// The instance's extensions DLSS needs, added to `want` when the loader has them (all: what it has)
 void dlss_instance_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
 /// The device's extensions DLSS needs, added to `want` when the device has them
@@ -33,9 +37,10 @@ struct TemporalFrame;
 /// Whether it is asked for now: the Insert menu's Frame generation by row (Auto), RX_VK_DLSS_FG=0 / 1 over it (and the build
 /// has it)
 bool dlss_fg_wanted();
-/// Whether it makes the sets as far as is known: asked for, on a device DLSS runs on, NGX's answer not a no and its feature
-/// not given up (the swapchain's present mode follows it: vk_main.cpp swapchain_dlssg)
-bool dlss_fg_runs();
+/// Whether it makes the sets of `frames` made frames (the multiplier less 1) as far as is known: asked for, on a device DLSS
+/// runs on, NGX's answer not a no, its feature not given up and its runtime making that many (an older one makes 1 at the
+/// most, so 3x and 4x are the renderer's own). The swapchain's present mode follows it: vk_main.cpp swapchain_dlssg
+bool dlss_fg_runs(int frames);
 /// Frame generation's device extensions, asked of NGX, added to `want` when the device has them
 void dlss_fg_device_extensions(std::vector<const char*>& want, const std::vector<VkExtensionProperties>& all);
 /// The chain's frame (vk_temporal.cpp, after its engine's evaluation): its depth and motion copied, its camera kept, for the
