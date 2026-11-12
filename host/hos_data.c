@@ -42,6 +42,7 @@
 #else
 #include <limits.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #define SEP '/'
 #define SEP_S "/"
@@ -59,6 +60,7 @@ static char set_aside[MAX_PATH];   /* (<game>/user renamed after a copy whose or
 /* (saves_link: the saves hold a link, kept where they are, or are one (2); portable: a portable install's data folder;
    saves_twice: saves both in <game>/user and in the data folder) */
 static int saves_link, portable, saves_twice;
+static int leftover;   /* (1: a leftover of an earlier move set aside; 2: found, but still held where it is) */
 static char unread_options[MAX_PATH], unread_env[MAX_PATH];   /* (a settings file beside the game the game does not read) */
 static char kept_first[MAX_PATH];
 static char saves_from[MAX_PATH];
@@ -224,7 +226,94 @@ static int move_entry(const char *from, const char *to, int *left) {
     return 0;
 }
 
-/* <game>/user's entries into the data folder, all or none: the folder the saves are in after it */
+/* (the clock, in the file system's ticks: a leftover of a move is told from saves written since by its files' times) */
+static long long now_ticks(void) {
+#ifdef _WIN32
+    FILETIME t;
+    GetSystemTimeAsFileTime(&t);
+    return (long long)(((unsigned long long)t.dwHighDateTime << 32) | t.dwLowDateTime);
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+#endif
+}
+static long long file_ticks(const char *p) {
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &d)) return 0;
+    return (long long)(((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime);
+#else
+    struct stat st;
+    if (lstat(p, &st)) return 0;
+    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+#endif
+}
+/* the newest write of a file under p (the files, not the folders: deleting entries changes a folder's time) */
+static long long newest_file(const char *p) {
+    if (is_link(p) || !is_dir(p)) return file_ticks(p);
+    long long newest = 0;
+    char pattern[MAX_PATH];
+    snprintf(pattern, sizeof pattern, "%s" SEP_S "*", p);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+            char a[MAX_PATH];
+            snprintf(a, sizeof a, "%s" SEP_S "%s", p, fd.cFileName);
+            const long long t = newest_file(a);
+            if (t > newest) newest = t;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    return newest;
+}
+
+/* The record of the moves: .hookshot-moved in the data folder, a line "<ticks> <folder>" for each <game>/user moved into it.
+   A later start that finds such a folder again, holding only files from before its move, takes it for what the move could not
+   delete (a file held open, read-only), sets it aside and keeps the data folder; it never takes it for the saves. Files written
+   since (an older build started in that game folder after the move) are saves of their own: saves in two places */
+static long long moved_at(const char *beside) {
+    char path[MAX_PATH], line[MAX_PATH + 32];
+    long long at = 0;
+    if (!hos_data_path(path, sizeof path, ".hookshot-moved")) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f)) {
+        char *sp = strchr(line, ' ');
+        if (!sp) continue;
+        sp[strcspn(sp, "\r\n")] = 0;
+        if (!strcmp(sp + 1, beside)) at = strtoll(line, NULL, 10);
+    }
+    fclose(f);
+    return at;
+}
+static void record_move(const char *beside) {
+    char path[MAX_PATH];
+    if (!hos_data_path(path, sizeof path, ".hookshot-moved")) return;
+    FILE *f = fopen(path, "a");
+    if (f) fprintf(f, "%lld %s\n", now_ticks(), beside), fclose(f);
+}
+/* <game>/user renamed user.moved (or .moved.<n>), so that no later start takes what is in it for saves: 1 when it was */
+static int put_aside(const char *beside) {
+    char aside[MAX_PATH];
+    for (int n = 1; n < 100; n++) {
+        snprintf(aside, sizeof aside, n == 1 ? "%s.moved" : "%s.moved.%d", beside, n);
+        if (!exists(aside) && MoveFileExA(beside, aside, 0)) {
+            snprintf(set_aside, sizeof set_aside, "%s", aside);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* <game>/user's entries into the data folder, all or none: the folder the saves are in after it. Each entry is renamed (the
+   same drive) or copied (another drive, or holding a link on Linux); no original is deleted before every entry has gone. One
+   that cannot go undoes the others (the renamed renamed back, the copies deleted: they are ours), so the saves stay whole in
+   <game>/user, which nothing has touched. Only then are the copied originals deleted: what cannot be (a file held open,
+   read-only) is a leftover, set aside as user.moved, and the move is recorded (moved_at) so that a later start never takes
+   a leftover for the saves, even when it could not be set aside */
 enum { MAX_SAVE_ENTRIES = 64 };
 static const char *move_saves(const char *beside) {
     if (!is_dir(beside)) return data_dir;
@@ -233,11 +322,18 @@ static const char *move_saves(const char *beside) {
         saves_link = 2;
         return beside;
     }
+    const long long moved = moved_at(beside);
+    if (moved && newest_file(beside) <= moved) {   /* (what an earlier move could not delete: not saves, whatever its names) */
+        leftover = 1;
+        if (!put_aside(beside)) leftover = 2;   /* (still held: the next start tries again; the data folder is used meanwhile) */
+        return data_dir;
+    }
 #ifndef _WIN32
     char real[PATH_MAX];
     move_old = realpath(beside, real), move_new = data_dir;   /* (copy_link: links to entries that move too follow them) */
 #endif
     static char names[MAX_SAVE_ENTRIES][MAX_PATH];
+    static char how[MAX_SAVE_ENTRIES];   /* (1 renamed, 2 copied) */
     int count = 0;
     char pattern[MAX_PATH];
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", beside);
@@ -260,44 +356,34 @@ static const char *move_saves(const char *beside) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
     if (saves_kept) return beside;
-    int left = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < count; i++) {   /* (every entry over: renamed, or copied with its original kept for now) */
         char from[MAX_PATH], to[MAX_PATH];
         snprintf(from, sizeof from, "%s" SEP_S "%s", beside, names[i]);
         snprintf(to, sizeof to, "%s" SEP_S "%s", data_dir, names[i]);
-        if (move_entry(from, to, &left)) {
-            saves_moved++;
-            continue;
-        }
-        /* (one could not go: those that went come back, so the saves stay whole in one place) */
+        how[i] = !tree_has_link(from) && MoveFileExA(from, to, 0) ? 1 : copy_tree(from, to) ? 2 : 0;
+        if (how[i]) continue;
+        delete_tree(to);   /* (a copy cut short) */
+        /* (one could not go: the others come back as they were, and the saves stay whole in <game>/user) */
         saves_kept = count - i;
-#ifndef _WIN32
-        char real_data[PATH_MAX];
-        move_old = realpath(data_dir, real_data), move_new = beside;   /* (the links made again go back the other way) */
-#endif
         for (int k = i - 1; k >= 0; k--) {
-            snprintf(from, sizeof from, "%s" SEP_S "%s", data_dir, names[k]);
-            snprintf(to, sizeof to, "%s" SEP_S "%s", beside, names[k]);
-            /* (what its copy left of the original, part deleted, goes first: the whole copy comes back in its place. One that
-               cannot be deleted keeps both: nothing lost, the whole copy stays in the data folder) */
-            if (exists(to)) delete_tree(to);
-            if (exists(to) || !move_entry(from, to, NULL)) saves_kept++;
+            snprintf(from, sizeof from, "%s" SEP_S "%s", beside, names[k]);
+            snprintf(to, sizeof to, "%s" SEP_S "%s", data_dir, names[k]);
+            if (how[k] == 2) delete_tree(to);   /* (a copy: its original is still there, untouched) */
+            else if (!MoveFileExA(to, from, 0)) saves_kept++;   /* (a rename back on the same drive: kept where it went if not) */
         }
-        saves_moved = 0;
         return beside;
     }
-    if (!RemoveDirectoryA(beside) && (left || exists(beside))) {
-        /* (copied whole, but some of the original could not be deleted: renamed, so a later start does not take what is left
-           for saves to move, find it in the data folder already and go back to it) */
-        char aside[MAX_PATH];
-        for (int n = 1; n < 100; n++) {
-            snprintf(aside, sizeof aside, n == 1 ? "%s.moved" : "%s.moved.%d", beside, n);
-            if (!exists(aside) && MoveFileExA(beside, aside, 0)) {
-                snprintf(set_aside, sizeof set_aside, "%s", aside);
-                break;
-            }
+    saves_moved = count;
+    int left = 0;
+    for (int i = 0; i < count; i++)   /* (every copy whole: the originals go now) */
+        if (how[i] == 2) {
+            char from[MAX_PATH];
+            snprintf(from, sizeof from, "%s" SEP_S "%s", beside, names[i]);
+            delete_tree(from);
+            left |= exists(from);
         }
-    }
+    record_move(beside);
+    if (!RemoveDirectoryA(beside) && (left || exists(beside))) put_aside(beside);
     return data_dir;
 }
 
@@ -542,7 +628,7 @@ const wchar_t *hos_data_dir_w(void) {
 
 void hos_data_log_migration(void) {
     hos_log("data: %s%s", data_dir, portable ? " (a portable install, .hookshot_builder_home: the game folder's user)" : "");
-    if (saves_moved || saves_kept || saves_link) {
+    if (saves_moved || saves_kept || saves_link || leftover) {
         if (saves_link == 2)
             hos_log("data: %s is a link (the player's own place for the saves): used as it is, the settings with them", saves_from);
         else if (saves_link)
@@ -551,12 +637,21 @@ void hos_data_log_migration(void) {
         else if (saves_kept)
             hos_log("data: %d of %s's entries could not move: the saves stay in %s, the settings with them", saves_kept, saves_from,
                     saves_from);
+        else if (leftover == 1)
+            hos_log("data: %s held only what an earlier move of the saves could not delete: set aside as %s; the saves are in %s",
+                    saves_from, set_aside, data_dir);
+        else if (leftover == 2)
+            hos_log("data: %s holds only what an earlier move of the saves could not delete, and is still in use: left as it is, "
+                    "the saves are in %s", saves_from, data_dir);
+        else {
+            hos_log("data: the saves moved from %s", saves_from);
+            if (set_aside[0])
+                hos_log("data: %s could not be deleted whole after its copy: what is left is set aside as %s", saves_from,
+                        set_aside);
+        }
         if (saves_twice)
             hos_log("data: saves in two places: this game folder's (used) and the shared data folder's (not used): see "
                     "saves-in-two-places.txt in the game folder");
-        else hos_log("data: the saves moved from %s", saves_from);
-        if (set_aside[0])
-            hos_log("data: %s could not be deleted whole after its copy: what is left is set aside as %s", saves_from, set_aside);
     }
     if (moved_files) hos_log("data: %d settings files moved from the game folder", moved_files);
     if (tidied_files) hos_log("data: %d logs and shader caches moved into the game folder's logs and cache folders", tidied_files);

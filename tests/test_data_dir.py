@@ -20,7 +20,8 @@ chose and the saves' folder. The program is copied into game folders built in a 
 - a portable install (.hookshot_builder_home): the data folder is <game>/user, and nothing goes to the per-user folder;
 - the game in bin/: the files come from the folder above it, the one with image.bin;
 - across file systems (the data folder on another drive, where a rename fails: /dev/shm against /tmp here), the saves are
-  copied and deleted; an entry that cannot be copied brings back the ones that went (all or none); a link is never copied
+  copied, every one, and only then the originals deleted; an entry that cannot be copied deletes the copies made (the
+  originals untouched, whole); what a move could not delete is never taken for the saves by a later start, held or not; an entry that cannot be copied brings back the ones that went (all or none); a link is never copied
   through: it is made again in the data folder (Linux), and the folder it points to is untouched; an original that cannot be deleted after its
   copy leaves <game>/user renamed user.moved, so the next start keeps the data folder.
 
@@ -160,6 +161,60 @@ def other_fs(tmp, built):
             assert user2 == data, (user2, out)
         finally:
             for d in (game / "user.moved" / "save" / "0100", game / "user" / "save" / "0100"):
+                if d.exists():
+                    os.chmod(d, 0o755)
+
+        # (the native Windows report on #2317, cases 1 and 2) an entry whose original cannot be deleted whole, and a later one that
+        # cannot be copied: no original is deleted before every entry has gone, so the copies made are deleted and <game>/user
+        # stays as it was, whole, whatever order the entries are listed in. Nothing of it in the data folder
+        game = tmp / "r" / "game"
+        exe = game_folder(game, built)
+        # (z-tree made first: tmpfs lists the newest first, so a-tree is tried first, as in the report; the result must not
+        # depend on the order, and with z-tree first there is nothing to undo)
+        files = ("z-tree/one", "z-tree/two", "a-tree/one", "a-tree/held/two")
+        for f in files:
+            (game / "user" / f).parent.mkdir(parents=True, exist_ok=True)
+            (game / "user" / f).write_text(f)
+        os.chmod(game / "user" / "a-tree" / "held", 0o555)   # (a-tree/one can be deleted, held/two cannot: a partial original)
+        os.chmod(game / "user" / "z-tree" / "two", 0)   # (cannot be read: its copy fails)
+        try:
+            data, user, out = run(exe, [], tmp / "r", other / "r")
+        finally:
+            os.chmod(game / "user" / "z-tree" / "two", 0o644)
+            os.chmod(game / "user" / "a-tree" / "held", 0o755)
+        assert user == data == game / "user", (user, out)
+        for f in files:
+            assert (game / "user" / f).read_text() == f, (f, out)
+        shared = other / "r" / "hookshot"
+        assert not any((shared / n).exists() for n in ("a-tree", "z-tree", "save", "mouse_sens.txt")), out
+        assert (game / "user" / "save" / "0100" / "file").read_text() == "my save"
+
+        # (case 3) copied whole, an original that cannot be deleted whole, and <game>/user that cannot be set aside (the game
+        # folder read-only): the first start uses the whole copy; a later start does not take what was left for the saves, still
+        # held or not, and sets it aside once it can
+        game = tmp / "s" / "game"
+        exe = game_folder(game, built)
+        (game / "user" / "a-tree").mkdir()
+        for f in ("one", "two"):
+            (game / "user" / "a-tree" / f).write_text("a-tree/" + f)
+        os.chmod(game / "user" / "a-tree", 0o555)
+        shared = other / "s" / "hookshot"
+        try:
+            os.chmod(game, 0o555)   # (user/ cannot be renamed)
+            try:
+                data, user, out = run(exe, [], tmp / "s", other / "s")
+                assert user == data == shared, (user, out)
+                assert (shared / "a-tree" / "one").exists() and (shared / "save" / "0100" / "file").read_text() == "my save"
+                assert (game / "user" / "a-tree").exists() and not (game / "user.moved").exists(), out
+                _, user2, out = run(exe, [], tmp / "s", other / "s")   # (still held: left as it is, the data folder used)
+                assert user2 == shared and "still in use" in out, (user2, out)
+            finally:
+                os.chmod(game, 0o755)
+            _, user3, out = run(exe, [], tmp / "s", other / "s")   # (released: set aside, the data folder used)
+            assert user3 == shared and not (game / "user").exists() and (game / "user.moved" / "a-tree").exists(), (user3, out)
+            assert "could not delete: set aside" in out, out
+        finally:
+            for d in (game / "user" / "a-tree", game / "user.moved" / "a-tree"):
                 if d.exists():
                     os.chmod(d, 0o755)
 
