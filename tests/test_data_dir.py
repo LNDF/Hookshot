@@ -84,7 +84,7 @@ def game_folder(root, built, in_bin=False):
         "mkw_vk_pipelines_play_3.bin": "play", "mkw_vk_pipelines.stamp": "stamp", "hookshot_programs.bin": "programs", "hookshot_programs.idx": "index",
         "hookshot_programs.bin.lock": "", "hookshot_pipelines.bin": "notes", "hookshot_prepared.bin": "prepared",
         "hookshot_shaders.bin": "seed", "hookshot_pipeline_states_shipped.bin": "shipped",
-        "hookshot_pipelines.bin.running": "1\n", "hookshot_programs.zst.bin": "zstd", "hookshot_load_start.txt": "start\n", "mkw_vk_pipelines_play_4.bin.tmp": "cut short",
+        "hookshot_pipelines.bin.running": "1\n", "hookshot_programs.zst.bin": "zstd", "hookshot_load_start.txt": "start\n", "mkw_vk_pipelines_play_4.bin.tmp": "cut short", "mkw_vk_pipelines.bin.tmp-a1B2c3": "cut short",
     }
     for name, text in files.items():
         (root / name).write_text(text)

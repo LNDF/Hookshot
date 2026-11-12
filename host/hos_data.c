@@ -435,9 +435,9 @@ static void tidy_game(const char *game) {
     for (size_t i = 0; i < sizeof to_cache / sizeof *to_cache; i++) tidied_files += move_file(game, to_cache[i], cache);
     tidied_files += move_pcache(game, cache);
     tidied_files += move_as(game, "mkw_vk_pipelines.stamp", cache, "hookshot_vk_pipelines.stamp");   /* (which translator made them: pcache_stamp.h) */
-    {   /* (what a write cut short left of the old pipeline cache: a .tmp, never read) */
+    for (int i = 0; i < 2; i++) {   /* (what a write cut short left of the old pipeline cache: a .tmp or .tmp-<n>, never read) */
         char pattern[MAX_PATH];
-        snprintf(pattern, sizeof pattern, "%s%s*.tmp", game, old_pcache);
+        snprintf(pattern, sizeof pattern, "%s%s*%s", game, old_pcache, i ? ".tmp-*" : ".tmp");
         WIN32_FIND_DATAA fd;
         HANDLE h = FindFirstFileA(pattern, &fd);
         if (h != INVALID_HANDLE_VALUE) {
