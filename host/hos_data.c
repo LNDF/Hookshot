@@ -175,6 +175,8 @@ static int copy_tree(const char *from, const char *to) {
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", from);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
+    /* An empty directory is a complete copy; an unreadable listing is not. */
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
     int ok = 1;
     if (h != INVALID_HANDLE_VALUE) {
         do {
@@ -184,6 +186,7 @@ static int copy_tree(const char *from, const char *to) {
             snprintf(b, sizeof b, "%s" SEP_S "%s", to, fd.cFileName);
             ok = copy_tree(a, b);
         } while (ok && FindNextFileA(h, &fd));
+        if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = 0;
         FindClose(h);
     }
     return ok;
