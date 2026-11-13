@@ -42,7 +42,6 @@
 #else
 #include <limits.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <unistd.h>
 #define SEP '/'
 #define SEP_S "/"
@@ -240,74 +239,108 @@ static int move_entry(const char *from, const char *to, int *left) {
     return 0;
 }
 
-/* (the clock, in the file system's ticks: a leftover of a move is told from saves written since by its files' times) */
-static long long now_ticks(void) {
-#ifdef _WIN32
-    FILETIME t;
-    GetSystemTimeAsFileTime(&t);
-    return (long long)(((unsigned long long)t.dwHighDateTime << 32) | t.dwLowDateTime);
-#else
-    struct timespec t;
-    clock_gettime(CLOCK_REALTIME, &t);
-    return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
-#endif
-}
-static long long file_ticks(const char *p) {
+/* (a file's size and last write, as the record of a leftover keeps them: 1 when it could be read) */
+static int file_stamp(const char *p, long long *size, long long *ticks) {
 #ifdef _WIN32
     WIN32_FILE_ATTRIBUTE_DATA d;
     if (!GetFileAttributesExA(p, GetFileExInfoStandard, &d)) return 0;
-    return (long long)(((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime);
+    *size = (long long)(((unsigned long long)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+    *ticks = (long long)(((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime);
 #else
     struct stat st;
     if (lstat(p, &st)) return 0;
-    return (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
+    *size = (long long)st.st_size;
+    *ticks = (long long)st.st_mtim.tv_sec * 1000000000LL + st.st_mtim.tv_nsec;
 #endif
-}
-/* the newest write of a file under p (the files, not the folders: deleting entries changes a folder's time) */
-static long long newest_file(const char *p) {
-    if (is_link(p) || !is_dir(p)) return file_ticks(p);
-    long long newest = 0;
-    char pattern[MAX_PATH];
-    snprintf(pattern, sizeof pattern, "%s" SEP_S "*", p);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            char a[MAX_PATH];
-            snprintf(a, sizeof a, "%s" SEP_S "%s", p, fd.cFileName);
-            const long long t = newest_file(a);
-            if (t > newest) newest = t;
-        } while (FindNextFileA(h, &fd));
-        FindClose(h);
-    }
-    return newest;
+    return 1;
 }
 
-/* The record of the moves: .hookshot-moved in the data folder, a line "<ticks> <folder>" for each <game>/user moved into it.
-   A later start that finds such a folder again, holding only files from before its move, takes it for what the move could not
-   delete (a file held open, read-only), sets it aside and keeps the data folder; it never takes it for the saves. Files written
-   since (an older build started in that game folder after the move) are saves of their own: saves in two places */
-static long long moved_at(const char *beside) {
-    char path[MAX_PATH], line[MAX_PATH + 32];
-    long long at = 0;
-    if (!hos_data_path(path, sizeof path, ".hookshot-moved")) return 0;
-    FILE *f = fopen(path, "r");
-    if (!f) return 0;
-    while (fgets(line, sizeof line, f)) {
-        char *sp = strchr(line, ' ');
-        if (!sp) continue;
-        sp[strcspn(sp, "\r\n")] = 0;
-        if (!strcmp(sp + 1, beside)) at = strtoll(line, NULL, 10);
+/* The record of what a move left behind: .hookshot-moved in the data folder. A move that could neither delete all of
+   <game>/user nor set it aside writes "L <folder>", then "F <size> <write time> <path in it>" for each file left. A later
+   start that finds that folder holding only those files, unchanged, takes it for the leftover (a file held open, read-only):
+   it sets it aside and keeps the data folder, never taking it for the saves. A full move writes no record, so a <game>/user
+   found after one was made since (an older build started in that game folder): saves of their own, kept in use, and saves in
+   two places. So is one with any file the record does not name, or names with another size or write time: files are told by
+   what they are, not by when they were written (a save restored or copied keeps its old time) */
+typedef struct { char **line; int n, cap; } Lines;
+static int lines_add(Lines *l, const char *s) {
+    if (l->n == l->cap) {
+        const int cap = l->cap ? l->cap * 2 : 64;
+        char **grown = (char **)realloc(l->line, (size_t)cap * sizeof *grown);
+        if (!grown) return 0;
+        l->line = grown, l->cap = cap;
     }
-    fclose(f);
-    return at;
+    const size_t n = strlen(s) + 1;
+    if (!(l->line[l->n] = (char *)malloc(n))) return 0;
+    memcpy(l->line[l->n++], s, n);
+    return 1;
 }
-static void record_move(const char *beside) {
+static void lines_free(Lines *l) {
+    for (int i = 0; i < l->n; i++) free(l->line[i]);
+    free(l->line);
+    l->line = NULL, l->n = l->cap = 0;
+}
+/* the "F ..." lines of the files under root/rel, into out (or written to f): 0 when a folder could not be listed whole */
+static int file_lines(const char *root, const char *rel, Lines *out, FILE *f) {
+    char dir[MAX_PATH], pattern[MAX_PATH];
+    snprintf(dir, sizeof dir, rel[0] ? "%s" SEP_S "%s" : "%s", root, rel);
+    snprintf(pattern, sizeof pattern, "%s" SEP_S "*", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    int ok = 1;
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char sub[MAX_PATH], path[MAX_PATH];
+        snprintf(sub, sizeof sub, rel[0] ? "%s" SEP_S "%s" : "%s%s", rel, fd.cFileName);
+        snprintf(path, sizeof path, "%s" SEP_S "%s", root, sub);
+        if (is_dir(path) && !is_link(path)) {
+            ok = file_lines(root, sub, out, f);
+            continue;
+        }
+        long long size, ticks;
+        char line[MAX_PATH + 64];
+        if (!file_stamp(path, &size, &ticks)) { ok = 0; continue; }
+        snprintf(line, sizeof line, "F %lld %lld %s", size, ticks, sub);
+        if (f) fprintf(f, "%s\n", line);
+        else if (!lines_add(out, line)) ok = 0;
+    } while (ok && FindNextFileA(h, &fd));
+    if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = 0;
+    FindClose(h);
+    return ok;
+}
+static void record_leftover(const char *beside) {
     char path[MAX_PATH];
     if (!hos_data_path(path, sizeof path, ".hookshot-moved")) return;
     FILE *f = fopen(path, "a");
-    if (f) fprintf(f, "%lld %s\n", now_ticks(), beside), fclose(f);
+    if (!f) return;
+    fprintf(f, "L %s\n", beside);
+    file_lines(beside, "", NULL, f);
+    fclose(f);
+}
+/* 1 when beside holds only files the record says a move left there, as they were left */
+static int only_left(const char *beside) {
+    char path[MAX_PATH], line[MAX_PATH + 64];
+    if (!hos_data_path(path, sizeof path, ".hookshot-moved")) return 0;
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    Lines left = {0}, now = {0};
+    int found = 0, mine = 0, ok = 1;
+    while (ok && fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!strncmp(line, "L ", 2)) {   /* (the last record of this folder is the one that holds) */
+            if ((mine = !strcmp(line + 2, beside))) lines_free(&left), found = 1;
+        } else if (mine && !strncmp(line, "F ", 2)) ok = lines_add(&left, line);
+    }
+    fclose(f);
+    ok = ok && found && file_lines(beside, "", &now, NULL);
+    for (int i = 0; ok && i < now.n; i++) {
+        int named = 0;
+        for (int k = 0; !named && k < left.n; k++) named = !strcmp(now.line[i], left.line[k]);
+        ok = named;
+    }
+    lines_free(&left), lines_free(&now);
+    return ok;
 }
 /* <game>/user renamed user.moved (or .moved.<n>), so that no later start takes what is in it for saves: 1 when it was */
 static int put_aside(const char *beside) {
@@ -326,8 +359,8 @@ static int put_aside(const char *beside) {
    same drive) or copied (another drive, or holding a link on Linux); no original is deleted before every entry has gone. One
    that cannot go undoes the others (the renamed renamed back, the copies deleted: they are ours), so the saves stay whole in
    <game>/user, which nothing has touched. Only then are the copied originals deleted: what cannot be (a file held open,
-   read-only) is a leftover, set aside as user.moved, and the move is recorded (moved_at) so that a later start never takes
-   a leftover for the saves, even when it could not be set aside */
+   read-only) is a leftover, set aside as user.moved; when it cannot be, what it holds is recorded (only_left) so that a later
+   start never takes the leftover for the saves */
 enum { MAX_SAVE_ENTRIES = 64 };
 static const char *move_saves(const char *beside) {
     if (!is_dir(beside)) return data_dir;
@@ -336,8 +369,7 @@ static const char *move_saves(const char *beside) {
         saves_link = 2;
         return beside;
     }
-    const long long moved = moved_at(beside);
-    if (moved && newest_file(beside) <= moved) {   /* (what an earlier move could not delete: not saves, whatever its names) */
+    if (only_left(beside)) {   /* (what an earlier move could not delete, as it left it: not saves, whatever its names) */
         leftover = 1;
         if (!put_aside(beside)) leftover = 2;   /* (still held: the next start tries again; the data folder is used meanwhile) */
         return data_dir;
@@ -402,8 +434,8 @@ static const char *move_saves(const char *beside) {
             delete_tree(from);
             left |= exists(from);
         }
-    record_move(beside);
-    if (!RemoveDirectoryA(beside) && (left || exists(beside))) put_aside(beside);
+    if (!RemoveDirectoryA(beside) && (left || exists(beside)) && !put_aside(beside))
+        record_leftover(beside);   /* (still there, held: a later start must know it for what this move left) */
     return data_dir;
 }
 

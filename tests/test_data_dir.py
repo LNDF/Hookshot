@@ -218,6 +218,33 @@ def other_fs(tmp, built):
                 if d.exists():
                     os.chmod(d, 0o755)
 
+        # the same leftover, then an older build started in the folder writes a save in it: no longer only what the move
+        # left (the record names its files, by size and write time), so it is this folder's saves again: used, two places
+        game = tmp / "s2" / "game"
+        exe = game_folder(game, built)
+        (game / "user" / "a-tree").mkdir()
+        (game / "user" / "a-tree" / "one").write_text("a-tree/one")
+        os.chmod(game / "user" / "a-tree", 0o555)
+        shared = other / "s2" / "hookshot"
+        try:
+            os.chmod(game, 0o555)
+            try:
+                _, user, out = run(exe, [], tmp / "s2", other / "s2")
+                assert user == shared and (game / "user" / "a-tree").exists(), (user, out)
+                assert "L " + str(game / "user") in (shared / ".hookshot-moved").read_text()
+            finally:
+                os.chmod(game, 0o755)
+            (game / "user" / "save" / "0100").mkdir(parents=True)
+            (game / "user" / "save" / "0100" / "file").write_text("new")
+            data2, user2, out = run(exe, [], tmp / "s2", other / "s2")
+            assert data2 == user2 == game / "user" and not (game / "user.moved").exists(), (user2, out)
+            assert "saves in two places" in out and (game / "user" / "save" / "0100" / "file").read_text() == "new", out
+            assert (shared / "save" / "0100" / "file").read_text() == "my save"
+        finally:
+            for d in (game / "user" / "a-tree", game / "user.moved" / "a-tree"):
+                if d.exists():
+                    os.chmod(d, 0o755)
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -327,6 +354,22 @@ def main():
         (game / "user").rename(game / "user.old")
         data3, user3, _ = run(exe, [], tmp / "dg", xdg)
         assert data3 == user3 == data and (data / "save" / "0100" / "file").read_text() == "my save"
+        # the same with the older build's save written long before the move (a save restored or copied keeps its old time):
+        # still this folder's own saves, not what the move left. A full move leaves no record (.hookshot-moved names only
+        # the files a move could not delete), so no file time can make them look like a leftover
+        game = tmp / "dg-old" / "game"
+        exe = game_folder(game, built)
+        xdg = tmp / "dg-old" / "xdg"
+        data, _, _ = run(exe, [], tmp / "dg-old", xdg)
+        assert not (data / ".hookshot-moved").exists(), "a full move left nothing to record"
+        (game / "user" / "save" / "0100").mkdir(parents=True)
+        (game / "user" / "save" / "0100" / "file").write_text("new")
+        os.utime(game / "user" / "save" / "0100" / "file", (1000000000, 1000000000))   # (2001)
+        data2, user2, out = run(exe, [], tmp / "dg-old", xdg)
+        assert data2 == user2 == game / "user" and not (game / "user.moved").exists(), (data2, user2, out)
+        assert "saves in two places" in out and "held only what" not in out, out
+        assert (game / "user" / "save" / "0100" / "file").read_text() == "new"
+        assert (data / "save" / "0100" / "file").read_text() == "my save"
 
         # a relative link (user/save -> a folder beside the game, synced elsewhere), on the same drive: never renamed into the
         # data folder, where it would name nothing, but made again there to the same folder (#2282), which is left untouched

@@ -137,8 +137,8 @@ def main():
                     values, present, payload)
                 assert not (destination / "tree").exists(), "failed copy must be removed"
             else:
-                marker = copied.pop(".hookshot-moved", None)
-                assert marker is not None, "successful move was not recorded"
+                # (a full move leaves nothing behind, so it records nothing: test_data_dir.py has the leftover's record)
+                assert ".hookshot-moved" not in copied, ("a full move must not record a leftover", copied)
                 assert Path(values["selected"]) == destination and copied == payload, (values, copied)
                 assert not source.exists() and (destination / "tree").is_dir(), "successful copy was not committed"
     print("PASS: copy-listing errors preserve the active source; complete and empty copies still migrate; a user folder "
