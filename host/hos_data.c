@@ -61,6 +61,7 @@ static char set_aside[MAX_PATH];   /* (<game>/user renamed after a copy whose or
    saves_twice: saves both in <game>/user and in the data folder) */
 static int saves_link, portable, saves_twice;
 static int leftover;   /* (1: a leftover of an earlier move set aside; 2: found, but still held where it is) */
+static int saves_unread;   /* (a folder of the saves that could not be listed whole: they stay where they are) */
 static char unread_options[MAX_PATH], unread_env[MAX_PATH];   /* (a settings file beside the game the game does not read) */
 static char kept_first[MAX_PATH];
 static char saves_from[MAX_PATH];
@@ -144,16 +145,17 @@ static int tree_has_link(const char *p) {
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", p);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
+    /* (a folder that could not be listed whole may hold one: as one, and the saves stay where they are) */
+    if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND ? 0 : (saves_unread = 1);
     int found = 0;
-    if (h != INVALID_HANDLE_VALUE) {
-        do {
-            if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
-            char a[MAX_PATH];
-            snprintf(a, sizeof a, "%s" SEP_S "%s", p, fd.cFileName);
-            found = tree_has_link(a);
-        } while (!found && FindNextFileA(h, &fd));
-        FindClose(h);
-    }
+    do {
+        if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
+        char a[MAX_PATH];
+        snprintf(a, sizeof a, "%s" SEP_S "%s", p, fd.cFileName);
+        found = tree_has_link(a);
+    } while (!found && FindNextFileA(h, &fd));
+    if (!found && GetLastError() != ERROR_NO_MORE_FILES) found = saves_unread = 1;
+    FindClose(h);
     return found;
 }
 static int copy_tree(const char *from, const char *to) {
@@ -351,7 +353,11 @@ static const char *move_saves(const char *beside) {
     snprintf(pattern, sizeof pattern, "%s" SEP_S "*", beside);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return data_dir;
+    if (h == INVALID_HANDLE_VALUE) {   /* (none: nothing to move. Not listed: the saves stay, unread, never left behind) */
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) return data_dir;
+        saves_unread = 1, saves_kept++;
+        return beside;
+    }
     /* (first, whether every entry can go: none in the data folder already, and not more than are kept track of) */
     do {
         if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
@@ -366,7 +372,9 @@ static const char *move_saves(const char *beside) {
         if (exists(to) || count == MAX_SAVE_ENTRIES) saves_kept++;
         else snprintf(names[count++], MAX_PATH, "%s", fd.cFileName);
     } while (FindNextFileA(h, &fd));
+    if (GetLastError() != ERROR_NO_MORE_FILES) saves_unread = 1, saves_kept++;   /* (the listing stopped early: entries not seen) */
     FindClose(h);
+    if (saves_unread) saves_link = 0;   /* (tree_has_link's "link" was a folder it could not list) */
     if (saves_kept) return beside;
     for (int i = 0; i < count; i++) {   /* (every entry over: renamed, or copied with its original kept for now) */
         char from[MAX_PATH], to[MAX_PATH];
@@ -647,6 +655,9 @@ void hos_data_log_migration(void) {
         else if (saves_link)
             hos_log("data: %s holds a link (to a folder elsewhere): it is left as it is, the saves and settings stay in %s",
                     saves_from, saves_from);
+        else if (saves_unread && !saves_moved)
+            hos_log("data: %s could not be read whole (a folder of it could not be listed): the saves stay in %s, the settings "
+                    "with them", saves_from, saves_from);
         else if (saves_kept)
             hos_log("data: %d of %s's entries could not move: the saves stay in %s, the settings with them", saves_kept, saves_from,
                     saves_from);

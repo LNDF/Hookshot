@@ -19,7 +19,7 @@ DRIVER = r'''
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
-static int armed, injected, late, faults;
+static int armed, injected, late, faults, top;
 static HANDLE listing;
 static char source[MAX_PATH];
 static BOOL migration_rename(LPCSTR from, LPCSTR to, DWORD flags) {
@@ -31,6 +31,20 @@ static BOOL migration_rename(LPCSTR from, LPCSTR to, DWORD flags) {
     return MoveFileExA(from, to, flags);
 }
 static HANDLE migration_first(LPCSTR pattern, WIN32_FIND_DATAA *fd) {
+    /* (top: the move's own listing of the user folder, before anything moved) */
+    if (top && !injected && !strncmp(pattern, source, strlen(source)) && !strcmp(pattern + strlen(source) + 1, "*")) {
+        if (late) {
+            HANDLE h = FindFirstFileA(pattern, fd);
+            if (h == INVALID_HANDLE_VALUE) return h;
+            while (!strcmp(fd->cFileName, ".") || !strcmp(fd->cFileName, ".."))
+                if (!FindNextFileA(h, fd)) { FindClose(h); return INVALID_HANDLE_VALUE; }
+            listing = h;
+            return h;
+        }
+        injected = 1;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
     if (armed && faults && !injected && !strncmp(pattern, source, strlen(source))) {
         if (late) {
             HANDLE h = FindFirstFileA(pattern, fd);
@@ -65,7 +79,8 @@ const char *hos_user_dir;
 void hos_log(const char *fmt, ...) { (void)fmt; }
 int main(int argc, char **argv) {
     if (argc != 4) return 90;
-    late = !strcmp(argv[3], "next");
+    late = !strcmp(argv[3], "next") || !strcmp(argv[3], "list-next");
+    top = !strncmp(argv[3], "list", 4);
     faults = !strcmp(argv[3], "normal") ? 0 : !strcmp(argv[3], "empty") ? 2 : 1;
     snprintf(source, sizeof source, "%s", argv[1]);
     snprintf(data_dir, sizeof data_dir, "%s", argv[2]);
@@ -80,7 +95,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cc", default="gcc")
     p.add_argument("--source-root", type=Path, default=ROOT)
-    p.add_argument("--case", choices=("all", "first", "next", "normal", "empty"), default="all")
+    p.add_argument("--case", choices=("all", "first", "next", "normal", "empty", "list", "list-next"), default="all")
     a = p.parse_args()
     root = a.source_root.resolve()
     with tempfile.TemporaryDirectory(prefix="copy-enumeration-") as temporary:
@@ -91,12 +106,15 @@ def main():
                         "-I", str(root / "host"), str(driver),
                         str(root / "host/posix/win32_posix.c"), "-lpthread", "-ldl",
                         "-o", str(exe)], check=True)
-        cases = ("first", "next", "normal", "empty") if a.case == "all" else (a.case,)
+        cases = ("first", "next", "normal", "empty", "list", "list-next") if a.case == "all" else (a.case,)
         for case in cases:
             source, destination = tmp / case / "user", tmp / case / "data"
             (source / "tree").mkdir(parents=True)
             destination.mkdir()
             payload = {} if case == "empty" else {"tree/one": b"synthetic one", "tree/two": b"synthetic two"}
+            if case.startswith("list"):   # (two entries, so that a listing stopped after the first leaves one unseen)
+                (source / "other").mkdir()
+                payload["other/three"] = b"synthetic three"
             for name, value in payload.items():
                 (source / name).write_bytes(value)
             r = subprocess.run([str(exe), str(source), str(destination), case], check=True,
@@ -109,7 +127,11 @@ def main():
                       for p in destination.rglob("*") if p.is_file()}
             print("source_payload=%r destination_payload=%r" % (present, copied))
             assert values["injected"] == ("0" if case == "normal" else "1"), "harness fault was not exercised"
-            if case in ("first", "next"):
+            if case in ("list", "list-next"):   # (the user folder's own listing failed: nothing moves, nothing is recorded)
+                assert Path(values["selected"]) == source and present == payload, (
+                    "LISTING_FAILURE_SWITCHED_FOLDER: the saves must stay in use where they are", values, present, payload)
+                assert copied == {}, ("nothing may move when the user folder was not listed whole", copied)
+            elif case in ("first", "next"):
                 assert Path(values["selected"]) == source and present == payload, (
                     "COPY_ENUMERATION_FAILURE_COMMITTED: active source must remain complete",
                     values, present, payload)
@@ -119,7 +141,8 @@ def main():
                 assert marker is not None, "successful move was not recorded"
                 assert Path(values["selected"]) == destination and copied == payload, (values, copied)
                 assert not source.exists() and (destination / "tree").is_dir(), "successful copy was not committed"
-    print("PASS: copy-listing errors preserve the active source; complete and empty copies still migrate")
+    print("PASS: copy-listing errors preserve the active source; complete and empty copies still migrate; a user folder "
+          "that could not be listed whole stays in use, nothing moved")
 
 
 if __name__ == "__main__":
