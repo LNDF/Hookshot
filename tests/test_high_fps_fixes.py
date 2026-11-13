@@ -5,7 +5,9 @@ Sound: under a Frame rate cap above 60 the frame step is the frame's own time (0
 fed steps under 1 left sounds unreleased at area changes until the game's voice budget was full and sounds, then the music,
 stopped. The gate runs phase 0 once a whole step has built up (120 frames of 0.5: 60 runs; 144 of 60/144: 60), the other phases
 follow phase 0's choice, the engine is handed a whole step then, and a step of 1 or more, 0 or below, NaN, or no frame time at
-all (a cap of 60) runs every frame with the game's own step.
+all (a cap of 60) runs every frame with the game's own step. A step of 1 or more keeps the remainder, so around 60 fps (0.98 and
+1.02 alternating, 0.9 and 1.1, or mean 1 with jitter) the sound clock keeps the real one; a cap of 60 runs every phase, before
+the first phase 0 too and after a phase 0 that held the job.
 
 Solver: the game cuts frame step * n + 0.001 to its solver steps (n a 60 fps frame: 8 at 60 fps, 3 or 4 at 120 as the step
 wanders; with n = 4, 0 above 240). With the frames' own time and a step under 1 it is rounded up (10% leeway for the frame time's
@@ -34,7 +36,7 @@ static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
 static uint32_t bits(float f) { return oot_float_bits(f); }
 static int runs(float step, int frames, int timed) {
-    OotSoundGate g = {0};
+    OotSoundGate g = OOT_SOUND_GATE_INIT;
     int n = 0;
     for (int i = 0; i < frames; i++) {
         const int run = oot_sound_gate(&g, 0, step, timed);
@@ -42,6 +44,16 @@ static int runs(float step, int frames, int timed) {
         n += run;
     }
     return n;
+}
+/* (the sound engine's time over these frames' steps against the real time: what it is handed each frame the job runs) */
+static double sound_clock(const float *steps, int n) {
+    OotSoundGate g = OOT_SOUND_GATE_INIT;
+    double real = 0, sound = 0;
+    for (int i = 0; i < n; i++) {
+        real += steps[i];
+        if (oot_sound_gate(&g, 0, steps[i], 1)) sound += oot_bits_float(oot_sound_step(oot_float_bits(steps[i]), 1));
+    }
+    return sound / real;
 }
 int main(void) {
     CHECK(runs(0.5f, 120, 1) == 60);
@@ -51,11 +63,40 @@ int main(void) {
     CHECK(runs(0.5f, 120, 0) == 120);   /* (a cap of 60: every frame) */
     CHECK(runs(1.0f, 60, 1) == 60 && runs(1.5f, 60, 1) == 60);
     CHECK(runs(0.0f, 60, 1) == 60 && runs(-1.0f, 60, 1) == 60 && runs(NAN, 60, 1) == 60);
-    {   /* (a whole step after partial ones starts the remainder again) */
-        OotSoundGate g = {0};
+    {   /* (a whole step after partial ones runs with the game's step and keeps the remainder) */
+        OotSoundGate g = OOT_SOUND_GATE_INIT;
         CHECK(oot_sound_gate(&g, 0, 0.75f, 1) == 0 && oot_sound_gate(&g, 2, 0.75f, 1) == 0);
-        CHECK(oot_sound_gate(&g, 0, 1.0f, 1) == 1 && g.part == 0.0f);
-        CHECK(oot_sound_gate(&g, 0, 0.75f, 1) == 0 && oot_sound_gate(&g, 0, 0.75f, 1) == 1 && g.part == 0.5f);
+        CHECK(oot_sound_gate(&g, 0, 1.0f, 1) == 1 && g.part == 0.75f && oot_sound_gate(&g, 1, 1.0f, 1) == 1);
+        CHECK(oot_sound_gate(&g, 0, 0.75f, 1) == 1 && g.part == 0.5f);
+        CHECK(oot_sound_gate(&g, 0, 0.0f, 1) == 1 && g.part == 0.0f);   /* (a step of 0: as the game has it, the remainder cleared) */
+    }
+    {   /* (around 60 fps the sound clock keeps the real one: dropping the remainder at each whole step made it 0.51 of it) */
+        static float steps[20000];
+        for (int i = 0; i < 20000; i++) steps[i] = i & 1 ? 1.02f : 0.98f;
+        double r = sound_clock(steps, 20000);
+        CHECK(r > 0.999 && r < 1.001);
+        for (int i = 0; i < 20000; i++) steps[i] = i & 1 ? 1.1f : 0.9f;
+        r = sound_clock(steps, 20000);
+        CHECK(r > 0.999 && r < 1.001);
+        uint32_t x = 12345;   /* (mean 1, about 0.03 apart: a sum of uniforms) */
+        for (int i = 0; i < 20000; i++) {
+            float u = 0;
+            for (int k = 0; k < 12; k++) x = x * 1664525u + 1013904223u, u += (float)(x >> 8) / 16777216.0f;
+            steps[i] = 1.0f + (u - 6.0f) * 0.03f;
+        }
+        r = sound_clock(steps, 20000);
+        CHECK(r > 0.999 && r < 1.001);
+        for (int i = 0; i < 20000; i++) steps[i] = 0.5f;
+        r = sound_clock(steps, 20000);
+        CHECK(r > 0.999 && r < 1.001);
+    }
+    {   /* (a cap of 60 runs every phase: before any phase 0, and after a phase 0 that held the job at a cap above 60) */
+        OotSoundGate g = OOT_SOUND_GATE_INIT;
+        CHECK(oot_sound_gate(&g, 1, 1.0f, 0) == 1 && oot_sound_gate(&g, 2, 1.0f, 0) == 1);
+        OotSoundGate h = OOT_SOUND_GATE_INIT;
+        CHECK(oot_sound_gate(&h, 1, 1.0f, 1) == 1);   /* (above 60, before the first phase 0: it runs) */
+        CHECK(oot_sound_gate(&h, 0, 0.5f, 1) == 0 && oot_sound_gate(&h, 1, 0.5f, 0) == 1 && h.part == 0.0f);   /* (the cap changed) */
+        CHECK(oot_sound_gate(&h, 2, 0.5f, 0) == 1 && oot_sound_gate(&h, 0, 0.5f, 0) == 1);
     }
     CHECK(oot_sound_step(bits(0.5f), 1) == bits(1.0f));
     CHECK(oot_sound_step(bits(0.5f), 0) == bits(0.5f));

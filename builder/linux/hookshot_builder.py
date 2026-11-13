@@ -38,7 +38,8 @@ DLSS_LICENSE = (
     "NVIDIA DLSS is NVIDIA's, not Hookshot's. With it ticked, the build downloads NVIDIA's DLSS SDK (release v310.9.16) from "
     "github.com/NVIDIA/DLSS, under NVIDIA's own license, the NVIDIA RTX SDKs license:\n\n"
     "https://github.com/NVIDIA/DLSS/blob/9981c6350dc58c0ce21f024fd65e31e851c31689/LICENSE.txt\n\n"
-    "Its files stay on this PC (in the builder's ngx-sdk folder, and libnvidia-ngx-dlss.so in the game folder's ngx folder). "
+    "Its files stay on this PC (in the builder's ngx-sdk folder, and libnvidia-ngx-dlss.so and libnvidia-ngx-dlssg.so in "
+    "the game folder's ngx folder). "
     "Hookshot never includes or shares them: never share a game folder built with them.\n\n"
     "Do you accept NVIDIA's license?"
 )
@@ -151,6 +152,85 @@ def game_ready(folder):
     return linux_update.game_exe(folder) is not None
 
 
+def read_cgroup(path):
+    """The unified control group, or "" when /proc is unavailable."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return next((line.rstrip("\n")[3:] for line in f if line.startswith("0::")), "")
+    except OSError:
+        return ""
+
+
+def own_scope(env, cgroup="/proc/self/cgroup", which=shutil.which, run=subprocess.run):
+    """What goes before the game's command so that it outlives this window's systemd service, or [] when nothing has to.
+    A desktop that starts each launcher as a service of its own (app-hookshot@<id>.service: COSMIC, GNOME, KDE) stops that
+    service, and everything in its control group, when its main process ends; start_new_session leaves the session, not the
+    control group, so Play then closing the window had systemd stop the game too, with SIGKILL 90 s later (#2529). In a scope
+    of its own it stays. A terminal, a scope or no systemd: nothing to do, and the game starts as before"""
+    unit = read_cgroup(cgroup)
+    if not unit.rpartition("/")[2].endswith(".service"):
+        return []
+    tool = which("systemd-run", path=env.get("PATH"))
+    if not tool:
+        return []
+    scope = [tool, "--user", "--scope", "--collect", "--quiet", "--"]
+    # (once first with true: a user manager that cannot be reached would otherwise leave Play starting nothing)
+    try:
+        ok = run(scope + ["true"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return scope if ok else []
+
+
+def wait_scope(process, proc_root="/proc", clock=time.monotonic, sleep=time.sleep, timeout=2):
+    """Wait only until the real runner leaves this service, not until its game ends."""
+    parent = read_cgroup(os.path.join(proc_root, "self", "cgroup"))
+    if not parent:
+        return False
+    deadline = clock() + timeout
+    while process.poll() is None:
+        child = read_cgroup(os.path.join(proc_root, str(process.pid), "cgroup"))
+        if child and child != parent and not child.startswith(parent + "/"):
+            return True
+        left = deadline - clock()
+        if left <= 0:
+            break
+        sleep(min(0.01, left))
+    return False
+
+
+def start_scoped(scope, command, options, wait=wait_scope):
+    """Start once: a runner that times out cannot later start a second game beside the plain fallback."""
+    process = None
+    try:
+        gate, go = socket.socketpair()
+        with gate, go:
+            # stdout is normally discarded. Use it as a gate until /proc proves the runner has escaped;
+            # the shell restores /dev/null before exec, leaving the diagnostics' stdin/stderr sockets alone.
+            script = 'IFS= read -r ready <&1 || exit 1\n[ "$ready" = go ] || exit 1\nexec >/dev/null\nexec "$@"'
+            process = subprocess.Popen(scope + ["/bin/sh", "-c", script, "hookshot-scope"] + command,
+                                       **dict(options, stdout=gate))
+            gate.close()
+            if wait(process):
+                go.sendall(b"go\n")
+                return True
+    except OSError:
+        pass
+    # No "go" was sent. Closing the gate above forbids a late exec, even if the move races this cancellation.
+    if process is not None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:   # (a stuck runner still cannot pass its closed gate)
+            pass
+    return False
+
+
 def play(folder):
     """the game, on its own (it outlives this window), from its folder. The launcher already asked about updates."""
     exe = linux_update.game_exe(folder)
@@ -160,6 +240,7 @@ def play(folder):
     env["HOOKSHOT_NO_UPDATE_CHECK"] = "1"
     exe = os.path.abspath(exe)
     options = dict(cwd=folder, env=env, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    scope = own_scope(env)   # (out of the launcher's systemd service, when it runs in one: #2529)
     try:
         with open(os.path.join(HERE, "play-diagnostics.sh"), encoding="utf-8") as script:
             command = ["/bin/sh", "-c", script.read(), "hookshot-play", exe]
@@ -168,9 +249,14 @@ def play(folder):
         # The script reads the other end: what the game prints before its log opens)
         reading, writing = socket.socketpair()
         with reading, writing:
-            subprocess.Popen(command, **dict(options, stdin=reading, stderr=writing))
+            launch_options = dict(options, stdin=reading, stderr=writing)
+            if not scope or not start_scoped(scope, command, launch_options):
+                if scope:
+                    command.append("Hookshot: systemd scope hand-off failed; started without a separate scope.")
+                subprocess.Popen(command, **launch_options)
     except OSError:
-        subprocess.Popen([exe], **options)
+        if not scope or not start_scoped(scope, [exe], options):
+            subprocess.Popen([exe], **options)
 
 
 def share_pipeline_list(folder, out_dir=None, copy=None, open_path=None):
@@ -412,7 +498,7 @@ class Builder(tk.Tk):
         self.title("Hookshot Builder")
         self.apply_scale()
         self.apply_theme()
-        self.minsize(self.px(760), self.px(520))
+        self.minsize(self.px(760), min(self.px(520), self.winfo_screenheight() * 2 // 3))   # (scaled up, no taller than the screen)
         move_old_ngx_sdk()   # (before the settings are read: it may record the license in them)
         self.cfg = load_config()
         self.proc = None
@@ -615,13 +701,14 @@ class Builder(tk.Tk):
                 ("Hs%s.pbar" % style, {"side": "left", "sticky": "ns"})]})])
             s.configure(style + ".Horizontal.TProgressbar", thickness=h, background=GLASS)
 
-        # the log's scroll bar: a thumb on the log, no arrows
-        s.layout("Log.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
-            ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nsew"})]})])
-        s.configure("Log.Vertical.TScrollbar", troughcolor=LOG, background=RAISED_HOVER, bordercolor=LOG, lightcolor=RAISED_HOVER,
-                    darkcolor=RAISED_HOVER, gripcount=0, arrowsize=px(10))
-        s.map("Log.Vertical.TScrollbar", background=[("active", LINE_STRONG)], lightcolor=[("active", LINE_STRONG)],
-              darkcolor=[("active", LINE_STRONG)])
+        # the scroll bars: a thumb, no arrows, on the log and on a page that scrolls
+        for name, trough in (("Log", LOG), ("Page", PAGE)):
+            s.layout(name + ".Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": "1", "sticky": "nsew"})]})])
+            s.configure(name + ".Vertical.TScrollbar", troughcolor=trough, background=RAISED_HOVER, bordercolor=trough,
+                        lightcolor=RAISED_HOVER, darkcolor=RAISED_HOVER, gripcount=0, arrowsize=px(10))
+            s.map(name + ".Vertical.TScrollbar", background=[("active", LINE_STRONG)], lightcolor=[("active", LINE_STRONG)],
+                  darkcolor=[("active", LINE_STRONG)])
 
         # Play's triangle, and the hookshot of the window's head
         self.photo("play", px(11) + px(10), px(14), GO,
@@ -758,8 +845,12 @@ class Builder(tk.Tk):
         page = self.page = ttk.Frame(self)
         page.pack(fill="both", expand=True)
         self.header(page, step=0)
-        f = ttk.Frame(page, padding=(px(48), px(6), px(48), px(28)))
-        f.pack(fill="both", expand=True)
+        # (the page scrolls and the row with Build stays in view, as on Windows since #750: on a short screen, the Steam
+        # Deck's 800 px or a scaled one, the rows above pushed the button out of the window)
+        bottom = ttk.Frame(page, padding=(px(48), 0, px(48), px(28)))
+        bottom.pack(side="bottom", fill="x")
+        bottom.columnconfigure(0, weight=1)
+        f, scrolls = self.scrolled(page, padding=(px(48), px(6), px(48), px(18)))
         f.columnconfigure(0, weight=1, minsize=px(580))   # (every page px(800) wide: the window keeps its width, as on Windows)
         f.columnconfigure(1, minsize=px(20))
         f.columnconfigure(2, minsize=px(200))
@@ -821,11 +912,10 @@ class Builder(tk.Tk):
         ttk.Label(options, text="For NVIDIA RTX graphics cards. NVIDIA's files stay on this PC: never share a game folder built with them.",
                   style="Small.TLabel", wraplength=px(540)).pack(anchor="w", padx=(px(26), 0), pady=(px(2), 0))
 
-        f.rowconfigure(10, weight=1, minsize=px(18))
-        ttk.Label(f, textvariable=self.status, style="Status.TLabel", wraplength=px(800)).grid(
-            row=11, column=0, columnspan=3, sticky="w", pady=(0, px(12)))
-        foot = ttk.Frame(f)
-        foot.grid(row=12, column=0, columnspan=3, sticky="we")
+        ttk.Label(bottom, textvariable=self.status, style="Status.TLabel", wraplength=px(800)).grid(
+            row=0, column=0, sticky="w", pady=(0, px(12)))
+        foot = ttk.Frame(bottom)
+        foot.grid(row=1, column=0, sticky="we")
         foot.columnconfigure(1, weight=1)
         self.space_bar = ttk.Progressbar(foot, maximum=1.0, length=px(160), style="Go.Horizontal.TProgressbar")
         self.space_bar.grid(row=0, column=0)
@@ -837,6 +927,59 @@ class Builder(tk.Tk):
         self.out.trace_add("write", lambda *a: self.update_space())
         self.update_space()
         self.apply_mode()
+        scrolls()
+
+    def scrolled(self, parent, padding):
+        """a page's body that scrolls when the window is shorter than it: by the wheel or trackpad, the scroll bar (shown only
+        then), or dragging the page by touch. It asks for its height, but no more than the screen has room for. Returns the
+        body and what to call once it is filled"""
+        px = self.px
+        canvas = tk.Canvas(parent, background=PAGE, highlightthickness=0, borderwidth=0, yscrollincrement=px(16))
+        canvas.pack(fill="both", expand=True)
+        body = ttk.Frame(canvas, padding=padding)
+        item = canvas.create_window(0, 0, window=body, anchor="nw")
+        bar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview, style="Page.Vertical.TScrollbar")
+
+        def moved(first, last):
+            bar.set(first, last)
+            if float(first) <= 0 and float(last) >= 1:
+                bar.place_forget()
+            else:   # (over the page's right margin: the body keeps its width)
+                bar.place(in_=canvas, relx=1, x=-px(8), rely=0, relheight=1, anchor="ne")
+
+        def fit(event=None):
+            room = self.winfo_screenheight() - (parent.winfo_reqheight() - canvas.winfo_reqheight()) - px(80)
+            canvas.configure(width=body.winfo_reqwidth(), height=max(px(120), min(body.winfo_reqheight(), room)),
+                             scrollregion=(0, 0, body.winfo_reqwidth(), body.winfo_reqheight()))
+
+        def wheel(event):
+            w = event.widget
+            if isinstance(w, str) or not (str(w) + ".").startswith(str(canvas) + ".") or w.winfo_class() == "TCombobox":
+                return
+            canvas.yview_scroll(-3 if event.num == 4 or (event.num != 5 and event.delta > 0) else 3, "units")
+
+        def drag(w):
+            w.bind("<ButtonPress-1>", lambda e: canvas.scan_mark(0, e.y_root), add="+")
+            w.bind("<B1-Motion>", lambda e: canvas.scan_dragto(0, e.y_root, gain=1), add="+")
+
+        def done():
+            drag(canvas)
+            todo = [body]
+            while todo:
+                w = todo.pop()
+                if w.winfo_class() in ("TFrame", "TLabel"):
+                    drag(w)
+                todo += w.winfo_children()
+            self.update_idletasks()
+            fit()
+
+        canvas.configure(yscrollcommand=moved)
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(item, width=e.width))
+        body.bind("<Configure>", fit)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.bind_all(sequence, wheel)
+        canvas.bind("<Destroy>", lambda e: [self.unbind_all(s) for s in ("<MouseWheel>", "<Button-4>", "<Button-5>")])
+        return body, done
 
     def share_row(self, parent, folder, wrap=None):
         """Save my pipeline list (share_pipeline_list), and under it what it did"""

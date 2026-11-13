@@ -19,6 +19,16 @@
 // Without Reflex under frame generation its held-back frame added its whole delay (an RTX 5080 at 4x: +12 to +18 ms from
 // input to the screen against frame generation off with Reflex on, PR 2118's review).
 //
+// Each queue submit carries the game frame its GPU work belongs to (VkLatencySubmissionPresentIdNV, reflex_submit_id): the
+// game's rendering the frame being made, a batch the frame of its first command buffer, a present's copy the frame it shows,
+// frame generation's made frames none. Without it the driver guessed the frame of each submit; with frame generation the
+// display thread's copies and DLSS-G's work sit between the game's frames, and its "GPU end" of a frame read 243 to 442 ms
+// against ~21 ms from simulation start to present end (an RTX 5080 at 4x, PR 2118's review). A batch (RX_VK_BATCH,
+// vk_replay.cpp) is tagged with the frame of its first command buffer, read when the batch starts: one that spans two game
+// frames counts as the first's, and one begun before the frame's sleep returned goes untagged. An approximation that only
+// batching makes, and batching is on by default only with RADV, which has no Reflex. RX_VK_REFLEX_SUBMIT_IDS=0 (or false,
+// off, no: hookshot_env.h's rule) leaves every submit untagged, for comparisons.
+//
 // RX_VK_REFLEX_LOG=1: every 300 frames with Reflex on, the driver's own timings (vkGetLatencyTimingsNV) averaged in the log:
 // simulation start to present end, and to the GPU's end of rendering.
 #include "vk_reflex.h"
@@ -29,6 +39,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "hookshot_env.h"
 #include "vk_menu.h"
 #include "vk_work.h"   // (last: RX_VK_RECORDER=defer drains before the latency-sleep wait; =thread does not need to, the driver signals it)
 
@@ -233,6 +244,24 @@ void reflex_game_submitted() {
     std::lock_guard lk(r.mu);
     if (!on()) return;
     if (r.frame_marked) mark(VK_LATENCY_MARKER_RENDERSUBMIT_END_NV);
+}
+
+const void* reflex_submit_id(const void* next, uint64_t frame) {
+    static const char* const e = getenv("RX_VK_REFLEX_SUBMIT_IDS");
+    static const bool off = e && env_value_off(e);   // (=0, false, off or no: the switches' one rule)
+    if (off) return next;
+    Reflex& r = rx();
+    std::lock_guard lk(r.mu);
+    if (!on()) return next;
+    uint64_t id = frame;
+    if (id == kReflexThisFrame) {   // (the frame being made: its sleep returned and its markers were given)
+        if (!r.frame_marked) return next;
+        id = r.id;
+    }
+    if (!id || id <= r.last_present_id) return next;   // (none, or a frame shown already: the driver is told of no new work for it)
+    thread_local VkLatencySubmissionPresentIdNV s{VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV};
+    s.pNext = next, s.presentID = id;
+    return &s;
 }
 
 const VkPhysicalDevicePresentIdFeaturesKHR* reflex_present_id_features() {

@@ -347,6 +347,12 @@ int main() {
     names = {std::string(59, 'x') + "\xc3\xa9" + "yy"};   /* cut at a character's start, not inside the 2-byte one */
     opts.mic = 2, mic_chosen();
     CHECK(mic_want == std::string(59, 'x'));
+    names = {"USB Mic", "Webcam"};   /* a saved name read back (the options file's line, with its end) */
+    for (const char* line : {"USB Mic\n", "USB Mic\r\n", "USB Mic   \n"}) {   /* (the last: as an older build saved it) */
+        mic_want = mic_key(line), opts.mic = 2;
+        refresh_mics();
+        CHECK(mic_want == "USB Mic" && !mic_missing && opts.mic == 2 && !std::strcmp(tx_mic(2), "USB Mic") && told.index == 0);
+    }
     std::puts("PASS: the Microphone row keeps its choice by name, and tells the host");
     return 0;
 }
@@ -388,6 +394,8 @@ def main():
           'the Insert menu has no Microphone row')
     check(re.search(r'hos_mic_count,\s*hos_mic_name,\s*hos_mic_select', (ROOT / 'host' / 'rx_backend.c').read_text(encoding='utf-8')),
           'the menu is not given the microphones')
+    check('mic_want = mic_key(eq + 1);' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
+          'the saved microphone is not read through mic_key')
     check('if (!mic_want.empty()) refresh_mics();' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
           'the start lists the microphones (and starts SDL audio) even with none chosen')
     with tempfile.TemporaryDirectory(prefix='audio-in-') as t:

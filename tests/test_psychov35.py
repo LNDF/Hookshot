@@ -175,7 +175,8 @@ def header_checks():
         raise SystemExit("FAIL: kLuminance is not BT.709's Y row %s" % BT709_TO_XYZ[1])
 
 
-FIXTURE = r'''#include <cmath>
+FIXTURE = r'''#define _CRT_SECURE_NO_WARNINGS   /* (Windows: scanf is not deprecated here) */
+#include <cmath>
 #include <cstdio>
 #include "psychov35.h"
 struct Ops {

@@ -7,7 +7,10 @@
    unloads, the voices in use climb until the game's voice budget is full, and new sounds (sword, voices), then the area music,
    stop until a restart. Above 60 fps the job runs at 60 Hz: phase 0 adds the step to a remainder and runs once a whole step has
    built up, with a step of 1 (sound_step), keeping the rest; the job's other phases follow that frame's choice. Sound keeps the
-   clock on average. A step of 1 or more, and a step of 0 or less (or NaN), run as the game has them.
+   clock on average. A step of 1 or more runs as the game has it and keeps the remainder: around 60 fps (a cap above 60 with
+   the game near 60, or VRR) steps of 0.98 and 1.02 alternate, and the 0.98 that did not run comes back as a whole step later
+   (dropped, the sound clock ran at half the real one). A step of 0 or less (or NaN), and every phase at a cap of 60, run as the
+   game has them, and clear the remainder.
    (After zortos293/Lichii PR #1289 by auz466, GPL-3.0: the same gate as a code patch for the emulator.)
 
    The physics world's solver steps: the game sets them each update to (int)(frame step * the steps of a 60 fps frame + 0.001)
@@ -26,6 +29,7 @@ typedef struct {
     float part;   /* (the steps added up since the job last ran, under 1) */
     int run;      /* (phase 0's choice, for the other phases of the same frame) */
 } OotSoundGate;
+#define OOT_SOUND_GATE_INIT {0.0f, 1}   /* (every phase runs until a phase 0 has chosen) */
 
 static inline float oot_bits_float(uint32_t bits) {
     float f;
@@ -45,9 +49,18 @@ static inline int oot_sound_partial(float step, int timed) {
 
 /* 1: run the job now, 0: return from it at once */
 static inline int oot_sound_gate(OotSoundGate *g, uint32_t phase, float step, int timed) {
-    if (phase != 0) return g->run;
-    if (!oot_sound_partial(step, timed)) {
+    if (!timed) {   /* (a cap of 60: every phase of every frame, whatever came before) */
         g->part = 0.0f;
+        g->run = 1;
+        return 1;
+    }
+    if (phase != 0) return g->run;
+    if (!(step > 0.0f)) {   /* (0, below 0, NaN: as the game has it) */
+        g->part = 0.0f;
+        g->run = 1;
+        return 1;
+    }
+    if (step >= 1.0f) {   /* (a whole step or more: runs with it, the remainder kept for the next partial ones) */
         g->run = 1;
         return 1;
     }
