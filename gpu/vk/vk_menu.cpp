@@ -62,6 +62,7 @@
 #include <csignal>
 #include <cerrno>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1878,7 +1879,21 @@ void save() {
         }
         fclose(f);
     }
-    if (FILE* f = fopen(ini_path().c_str(), "w")) {
+    // (written to a part file beside it, then moved over it in one step: a write that fails, on a full disk, leaves the options as
+    // they were, where "w" on the file itself emptied it first. A link's target is written, as fopen did; a link whose target
+    // cannot be named here, one to a file not made yet or any on Windows, is written through as before, so it stays a link)
+    std::string path = ini_path();
+    bool through = false;
+#ifdef _WIN32
+    const DWORD attrs = GetFileAttributesA(path.c_str());
+    through = attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    if (char* real = realpath(path.c_str(), nullptr)) path = real, free(real);
+    else through = lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+    const std::string part = through ? path : path + ".new";
+    if (FILE* f = fopen(part.c_str(), "w")) {
         for (const Row& r : rows) {
             if (r.value == &opts.output_res) {   // (the size itself: host/nn_applet.c reads it)
                 const int v = saved_value(r.value);
@@ -1919,7 +1934,19 @@ void save() {
             }
             fprintf(f, "key_%s=%d,%d\n", bind_names[i], host->binding(HOS_BIND_KEY, i, 0), host->binding(HOS_BIND_KEY, i, 1));
         }
-        fclose(f);
+        bool ok = !ferror(f);
+        ok = fclose(f) == 0 && ok;
+#ifdef _WIN32
+        ok = ok && (through || MoveFileExA(part.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING));
+#else
+        ok = ok && (through || rename(part.c_str(), path.c_str()) == 0);
+#endif
+        if (!ok && through) {
+            logf("menu: hookshot_options.ini could not be written");
+        } else if (!ok) {
+            remove(part.c_str());
+            logf("menu: hookshot_options.ini could not be written: the options are as they were");
+        }
     }
 }
 
@@ -2400,11 +2427,19 @@ const Control controls[] = {{HOS_SW_A, "A"}, {HOS_SW_B, "B"}, {HOS_SW_X, "X"}, {
 constexpr int kControls = sizeof controls / sizeof controls[0];   // (then "Reset to defaults")
 // (the stick's and camera's directions: keys only; the ocarina's note rows take a gamepad input too, host/nn_hid.c)
 bool keys_only(int i) { return i < kControls && controls[i].button >= HOS_KEY_MOVE_UP && controls[i].button <= HOS_KEY_CAM_RIGHT; }
+// a row takes the touchpad click as its Input 1 or Input 2: then the click is that row's, not the menu's
+bool touchpad_bound() {
+    for (int i = 0; host && host->binding && i < kControls; i++)
+        for (int slot = 0; slot < 2 && !keys_only(i); slot++)
+            if (host->binding(HOS_BIND_PAD, controls[i].button, slot) == HOS_PAD_TOUCHPAD) return true;
+    return false;
+}
 // a pad input's name on the controller of the button prompts (the Button prompts row's choice; Auto: the face in use),
 // else by its place
 const char* pad_name(int p) {
     if (p < 0 || p >= HOS_PAD_N) return "None";
     static const char* paddles[] = {"R4", "L4", "R5", "L5"};
+    if (p == HOS_PAD_TOUCHPAD) return "Touchpad";
     if (p >= HOS_PAD_RPADDLE1) return paddles[p - HOS_PAD_RPADDLE1];
     static const char* t[HOS_PROMPT_KEYBOARD + 1][HOS_PAD_RPADDLE1] = {   // (by place, then HOS_PROMPT_*; the keyboard's: by place)
         {"Bottom button", "Right button", "Left button", "Top button", "Select / Back", "Home", "Start", "L stick press",
@@ -2492,11 +2527,9 @@ const int kTop = tab_row_count(TAB_PAGE);   // (Layout preset and Button prompts
 int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
 bool listen_armed = false;   // (once what started it was let go)
 int64_t listen_end = 0;
-std::string keys_text(int button) {
-    const int a = host->binding(HOS_BIND_KEY, button, 0), b = host->binding(HOS_BIND_KEY, button, 1);
-    std::string t = a ? key_name(a) : "";
-    if (b) t += std::string(a ? ", " : "") + key_name(b);
-    return t.empty() ? "None" : t;
+std::string key_text(int button, int slot) {
+    const int k = host->binding(HOS_BIND_KEY, button, slot);
+    return k ? key_name(k) : "None";
 }
 
 // ---- what is drawn: Dear ImGui over the window's image (vk_imgui.h) in the game's own style (vk_ui.h). Built anew at each
@@ -3248,12 +3281,17 @@ void draw_controls(ui::Ctx& c) {
                  hh + 18 * s, bar_top - 12 * s);
     }
     const float rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s, width = rx1 - rx0;
-    const float pad_x = rx0 + width * 0.32f, key_x = rx0 + width * 0.75f;
-    const float col_x[] = {pad_x, (pad_x + key_x) * 0.5f, key_x, rx1};
+    // (the names narrower than with one key column; each key cell as wide as a long key name needs, "Right click" chosen,
+    // within a sixth and a fifth of the row; the gamepad cells share the rest: at Small and Medium as wide as with one key
+    // column, at Large cut as they were)
+    const float key_w = std::clamp(ui::size_of(c.f.strong, 18 * s, "Right click").x + 30 * s, width * 0.16f, width * 0.2f);
+    const float pad_x = rx0 + width * 0.26f, key_x = rx1 - 2 * key_w;
+    const float col_x[] = {pad_x, (pad_x + key_x) * 0.5f, key_x, key_x + key_w, rx1};
     float top = hh + 22 * s;
     ui::text_mid_centre(c, c.f.body, 15 * s, col_x[kCtlAlternate], top + 8 * s, ui::kDim, "Gamepad");
+    ui::text_mid_centre(c, c.f.body, 15 * s, col_x[kCtlKeyboard2], top + 8 * s, ui::kDim, "Keyboard");
     ui::text_mid(c, c.f.body, 15 * s, rx0 + 20 * s, top + 27 * s, ui::kDim, "Button");
-    const char* titles[kCtlColumns] = {"Input 1", "Input 2", "Keyboard"};
+    const char* titles[kCtlColumns] = {"Input 1", "Input 2", "Key 1", "Key 2"};
     for (int col = kCtlPrimary; col < kCtlColumns; col++)
         ui::text_mid_centre(c, c.f.body, 15 * s, (col_x[col] + col_x[col + 1]) * 0.5f, top + 27 * s, ui::kDim, titles[col]);
     top += 43 * s;
@@ -3287,10 +3325,12 @@ void draw_controls(ui::Ctx& c) {
         hits.add(rx0, y0, pad_x, y1, menu_hit::kCtlRow, i);
         const bool keys = keys_only(i);
         for (int col = kCtlPrimary; col < kCtlColumns; col++) {
-            const bool keyboard = col == kCtlKeyboard, disabled = keys && !keyboard;
-            const float a = col_x[col] + (col == kCtlPrimary ? 0 : 3 * s), b = col_x[col + 1] - (keyboard ? 0 : 3 * s);
-            const std::string v = keyboard ? keys_text(ctl.button) : disabled ? "-" : pad_name(host->binding(HOS_BIND_PAD, ctl.button, col));
-            const bool here = sel && col == (keys ? kCtlKeyboard : ccol);
+            const bool keyboard = col >= kCtlKeyboard, disabled = keys && !keyboard;
+            const float a = col_x[col] + (col == kCtlPrimary ? 0 : 3 * s), b = col_x[col + 1] - (col == kCtlColumns - 1 ? 0 : 3 * s);
+            const std::string v = keyboard   ? key_text(ctl.button, menu_hit::ctl_key_slot(col))
+                                  : disabled ? "-"
+                                             : pad_name(host->binding(HOS_BIND_PAD, ctl.button, col));
+            const bool here = sel && col == menu_hit::ctl_column(ccol, keys);
             const ImVec2 va(a, y), vb(b, y + rh);
             if (here && listening) {   // (waiting for the new input: amber, the outline as a selected value's)
                 const float in = 4 * s;
@@ -4695,8 +4735,9 @@ void menu_tick() {
         if (force) pad_last = !strcmp(force, "pad");
     }
     auto pad = [&](int p) { return listening != 1 && (pad_press >> p & 1) != 0; };
-    // (hookshot) a DualShock 4's or DualSense's touchpad click is F1: it opens and closes the menu as the key does
-    if (pad(HOS_PAD_TOUCHPAD)) press[6] = true;
+    // (hookshot) a DualShock 4's or DualSense's touchpad click is F1, while no row of the Controls page takes it: it opens and
+    // closes the menu as the key does
+    if (pad(HOS_PAD_TOUCHPAD) && !touchpad_bound()) press[6] = true;
     if (host && host->binding)   // (A and B as bound now: the Controls page or the Layout preset can change them)
         menu_keys::confirm_back(host->binding(HOS_BIND_PAD, HOS_SW_A, 0), host->binding(HOS_BIND_PAD, HOS_SW_B, 0), &pad_confirm,
                                 &pad_back);
@@ -4816,7 +4857,7 @@ void menu_tick() {
             if (press[5] || prof_now() > listen_end) listening = 0, changed = true;   // (Esc, or nothing for a while)
             else if (listening == 1) {
                 if (!listen_armed) listen_armed = (raw & ~(1u << HOS_PAD_GUIDE)) == 0;
-                else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE) & ~(1u << HOS_PAD_TOUCHPAD)) {
+                else if (const uint32_t p = pad_press & ~(1u << HOS_PAD_GUIDE)) {
                     int bit = 0;
                     while (!(p >> bit & 1)) bit++;
                     host->bind(HOS_BIND_PAD, controls[csel - kTop].button, ccol, bit);
@@ -4833,8 +4874,8 @@ void menu_tick() {
                     }
                 if (!listen_armed) listen_armed = !down;
                 else if (down) {
-                    host->bind(HOS_BIND_KEY, controls[csel - kTop].button, 0, down);
-                    host->bind(HOS_BIND_KEY, controls[csel - kTop].button, 1, 0);
+                    const int i = csel - kTop;   // (the selected key cell's slot only: the other key stays)
+                    host->bind(HOS_BIND_KEY, controls[i].button, menu_hit::ctl_key_slot(menu_hit::ctl_column(ccol, keys_only(i))), down);
                     listening = 0, changed = true;
                     save();
                 }
@@ -4848,7 +4889,7 @@ void menu_tick() {
                 const int at = option ? hit.index : kTop + hit.index;   // (the page's row: its own rows first)
                 if (on && (moved || ptr.pressed)) {
                     if (at != csel) csel = at, changed = true;
-                    if (hit.part == menu_hit::kCtlCell && !keys_only(hit.index) && ccol != hit.side) ccol = hit.side, changed = true;
+                    if (hit.part == menu_hit::kCtlCell && ccol != hit.side) ccol = hit.side, changed = true;
                 }
                 if (ptr.pressed & HOS_MOUSE_LEFT) {
                     if (option) press[hit.side < 0 ? 3 : 4] = true;   // (a value's halves: Left and Right; the name: Right)
@@ -4868,26 +4909,26 @@ void menu_tick() {
                 set_row(r, *r.value + (press[3] ? -r.step : r.step), press[3] ? -1 : 1);
                 changed = true;
             } else if (i >= 0) {
-                if ((press[3] || press[4]) && i < kControls && !keys_only(i)) {
-                    ccol = (ccol + kCtlColumns + (press[3] ? -1 : 1)) % kCtlColumns;
+                if ((press[3] || press[4]) && i < kControls) {
+                    ccol = menu_hit::ctl_step(ccol, press[3] ? -1 : 1, keys_only(i));
                     changed = true;
                 }
-                const int col = keys_only(i) ? kCtlKeyboard : ccol;
+                const int col = menu_hit::ctl_column(ccol, keys_only(i));
                 if (press[7]) {
                     if (i == kControls) {
                         host->bind(HOS_BIND_PAD, -1, 0, 0);
                         opts.pad_layout = 0;
                         save();
                     }
-                    else listening = col == kCtlKeyboard ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
+                    else listening = menu_hit::ctl_key_slot(col) >= 0 ? 2 : 1, listen_armed = false, listen_end = prof_now() + 6000000000LL;
                     changed = true;
                 }
                 if ((press[8] || press[9]) && i < kControls) {
-                    if (col != kCtlKeyboard) {
+                    if (menu_hit::ctl_key_slot(col) < 0) {
                         host->bind(HOS_BIND_PAD, controls[i].button, col, -1);
                         opts.pad_layout = detect_pad_layout();
                     }
-                    else for (int k = 0; k < 2; k++) host->bind(HOS_BIND_KEY, controls[i].button, k, 0);
+                    else host->bind(HOS_BIND_KEY, controls[i].button, menu_hit::ctl_key_slot(col), 0);
                     changed = true;
                     save();
                 }

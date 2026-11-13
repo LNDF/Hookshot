@@ -1254,13 +1254,15 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
 
 /* ---- waveOut on SDL's audio (host/hos_sdl.c): a callback takes the written blocks in order and marks them done ---- */
 /* (the executable's: this file is in the Vulkan back end too, which plays no sound and has no hos_sdl.c) */
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
+void *hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
     __attribute__((weak));
+void hos_sdl_audio_close(void *out) __attribute__((weak));
 typedef struct {
     pthread_mutex_t mu;
     WAVEHDR *q[64];
     int head, count;
     DWORD pos;
+    void *sdl;   /* (what hos_sdl_audio_open opened) */
 } WaveOut;
 static void wave_pull(void *user, uint8_t *out, int len) {
     WaveOut *w = (WaveOut *)user;
@@ -1285,7 +1287,8 @@ MMRESULT waveOutOpen(HWAVEOUT *out, UINT device, const WAVEFORMATEX *f, DWORD_PT
     if (!hos_sdl_audio_open) return MMSYSERR_ERROR;
     WaveOut *w = (WaveOut *)calloc(1, sizeof *w);
     pthread_mutex_init(&w->mu, NULL);
-    if (!hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w)) {
+    w->sdl = hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w);
+    if (!w->sdl) {
         pthread_mutex_destroy(&w->mu);
         free(w);
         return MMSYSERR_ERROR;
@@ -1323,4 +1326,14 @@ MMRESULT waveOutReset(HWAVEOUT hw) {
     pthread_mutex_unlock(&w->mu);
     return 0;
 }
-MMRESULT waveOutClose(HWAVEOUT hw) { waveOutReset(hw); return 0; }
+/* (the device closed first, so wave_pull has stopped: a reset only emptied the queue, and the device stayed open. Opened
+   again after a stall, the default output then refused a second open and the sound stayed off) */
+MMRESULT waveOutClose(HWAVEOUT hw) {
+    WaveOut *w = (WaveOut *)hw;
+    if (!w) return MMSYSERR_ERROR;
+    if (hos_sdl_audio_close) hos_sdl_audio_close(w->sdl);
+    waveOutReset(hw);
+    pthread_mutex_destroy(&w->mu);
+    free(w);
+    return MMSYSERR_NOERROR;
+}

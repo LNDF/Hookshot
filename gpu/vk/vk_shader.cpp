@@ -964,6 +964,11 @@ const std::vector<Code>& codes_of(const NvnState& s) {
 }
 
 std::atomic<int64_t> st_translated, st_failed, st_translate_ns;
+std::atomic<int64_t> st_left_out;   // (the networks a card leaves out on purpose: not failures)
+/// A network this card leaves out on purpose (translate_into): upscale_stub draws in its place, so it is not a failure
+struct LeftOut : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
 
 } // namespace
 
@@ -1289,7 +1294,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                     at = e == std::string::npos ? keep.size() : e + 1;
                 }
                 if ((!kept_one && (Shader::Backend::SPIRV::mma_software || dev.props.vendorID != 0x10DE)) || env_on("RX_VK_NO_F16") || !dev.vk12.shaderFloat16)
-                    throw std::runtime_error("a network left out on this card");
+                    throw LeftOut("a network left out on this card");
             }
             const std::vector<uint32_t> spirv = Shader::Backend::SPIRV::EmitSPIRV(profile_pinned(), rt, t->program, bindings);
             // (EvilOOT) RX_VK_DUMP_SPV=<folder>: the SPIR-V of the programs RX_VK_MISS_LOG_PROG names (all: unset), for spirv-val
@@ -1405,6 +1410,17 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
         ptr_diag_log(p.key, csc ? "compute" : fsc ? "graphics" : "vertex");
         if (seed_capture) *seed_capture = std::move(kept);
         else program_cache_save(p, kept);
+    } catch (const LeftOut& e) {   // (counted and said apart from the failures: they would use up the 30 lines below)
+        p.failed = true;
+        if (!forced || forced->want.empty()) {   // (not an answer seed_compute tries)
+            st_left_out++;
+            static std::atomic<bool> said;
+            if (!said.exchange(true))
+                logf("vk: the game's networks this card does not run are left out (the first: program %016llx), not an error: a "
+                     "linear upscale takes their place", (unsigned long long)p.key);
+            else if (getenv("RX_VK_IR"))
+                logf("vk: program %016llx: %s", (unsigned long long)p.key, e.what());
+        }
     } catch (const std::exception& e) {
         p.failed = true;
         const bool trial = forced && !forced->want.empty();   // (an answer seed_compute tries: it may well not translate)
@@ -2440,6 +2456,9 @@ void shader_stats(int64_t* translated, int64_t* failed) {
     static int64_t hits_logged;
     if (st_cache_hits.load() >= hits_logged + 500) logf("vk: %lld programs from the program cache", (long long)(hits_logged = st_cache_hits.load()));
     *translated = st_translated, *failed = st_failed;
+}
+int64_t shader_left_out() {
+    return st_left_out;
 }
 double shader_translate_ms() {
     return st_translate_ns.load() / 1e6;
